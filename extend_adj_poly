@@ -1,0 +1,961 @@
+library(tidyverse)
+library(sf)
+library(ggplot2)
+library(openxlsx)
+library(tidyr)
+library(nngeo)
+library(buffeRs)
+library(lwgeom)
+
+options(scripen=999)
+
+cop_outline<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/__SOURCE FILES/COP_LEASE_LAYER/cop.shp")
+
+dsu<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/DIVESTITURES/EDDY COUNTY 2025/DSU SHAPEFILES/NON CORE DSUs/NON CORE DSUs 03 25 25.shp")
+dsu<-st_zm(dsu)
+dsu<-dsu%>%mutate(row_num=row_number())
+dsu_poly<-dsu%>%group_by(row_num)%>%
+  summarise(geometry=st_union(geometry))%>%st_cast('POLYGON')
+
+dsu<-left_join(dsu_poly,st_drop_geometry(dsu))
+
+dsu<-st_union(dsu)
+
+blk1<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/DIVESTITURES/EDDY COUNTY 2025/ABK/Shapefiles/Block 1 & 2 AOIs/BLK_1/BLK_1.shp")
+blk1<-blk1%>%mutate(id='block1')%>%select(id)
+blk2<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/DIVESTITURES/EDDY COUNTY 2025/ABK/Shapefiles/Block 1 & 2 AOIs/BLK_2_AOI/BLK_2_AOI.shp")
+blk2<-blk2%>%mutate(id='block2')%>%select(id)
+
+blk1blk2=rbind(blk1,blk2)
+
+state_county <-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/Individual Work/DM Work_COP/Common Mapping Shapefiles/COUNTY.shp")
+
+
+state_county_clip=state_county
+
+state_county_clip<-st_transform(state_county_clip,st_crs(dsu))
+
+NDB<- state_county_clip%>%filter(CNAME %in% c("EDDY","LEA"))
+
+
+acreage<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/Permian Inventory CoS Join/Op_Non_Unknown_Acreage/Combined_Acreage/Combined_Acreage.shp")
+
+acreage<-st_intersection(acreage,NDB)
+
+acreage<-acreage%>%mutate(Company=ifelse(grepl('APA CORP',Company),'PERMIAN RESOURCES',Company))
+
+sort(unique(acreage$Company))
+
+sections<- read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/Permian Inventory/Op_Non_Unknown_Acreage/sections_grid/sections_rowId.shp")
+
+acreage<-st_intersection(st_buffer(acreage,dist=0),st_transform(blk1blk2,st_crs(acreage)))
+
+acreage_sec<-st_intersection(acreage,st_transform(sections,st_crs(acreage)))
+
+acreageOrig=acreage
+
+cop<-dsu
+
+sections<-st_transform(sections,st_crs(acreage))
+
+
+end_df<-data.frame()
+
+
+i='MEWBOURNE OIL'
+
+touching_fctn<-function(i){
+  endeavor<-acreage%>%filter(Company==i)
+  
+  endeavor_int<- st_intersection(sections,endeavor)
+  
+  endeavor_int<- endeavor_int%>%mutate(area=as.numeric(st_area(geometry))/43560)%>%filter(area>40)
+  
+  endeavor_int<- sections%>%filter(row_id %in% c(endeavor_int$row_id))
+  
+  
+  cop_int<- st_intersection(sections,st_buffer(cop,dist=0))
+  cop_int<-st_buffer(cop_int,dist=0)
+  
+  cop_int<- cop_int%>%mutate(area=as.numeric(st_area(geometry))/43560)%>%filter(area>40)
+  
+  cop_int<- sections%>%filter(row_id %in% c(cop_int$row_id))
+  
+  
+  
+  cop_int<- cop_int%>%mutate(row_id=row_number())
+  endeavor_int<- endeavor_int%>%mutate(row_id=row_number())
+  
+  touching_list=data.frame(st_relate(cop_int,endeavor_int, pattern = "****1****")) # sides, not corners, internals
+  
+  endeavor_touching<- endeavor_int%>%filter(row_id %in% c(touching_list$col.id))
+  
+  combined<-rbind(st_as_sf(cop)%>%rename(geometry=x)%>%select(geometry),endeavor%>%select(geometry))
+  
+  endeavor_touching<- st_intersection(st_buffer(endeavor_touching,dist=0),st_buffer(combined,dist=0))
+  
+  endeavor_touching<-st_buffer(endeavor_touching,dist=0)
+  
+  endeavor_touching<- st_difference(endeavor_touching,st_buffer(cop,dist=0))
+  endeavor_touching<-st_buffer(endeavor_touching,dist=0)
+  
+  endeavor_touching<- st_transform(endeavor_touching,st_crs(endeavor))
+  
+  endeavor_touching<-endeavor_touching%>%mutate(Company=i)
+  end_df<-rbind(end_df,endeavor_touching)
+  
+  end_df<<-end_df
+  print(i)
+
+}
+
+lapply(unique(acreage$Company),touching_fctn)
+
+
+touch_final<- end_df%>%mutate(id_check=row_number())
+
+within=st_is_within_distance(st_centroid(touch_final),cop, dist = 2800)
+
+within2=data.frame(within)
+
+
+
+
+touch_final<-touch_final%>%filter(id_check %in% c(within2$row.id))
+
+
+touch_final<-touch_final%>%
+  group_by(Company)%>%
+  summarise(geometry=st_union(geometry))%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(acres=area/43560)%>%select(-area)
+
+# touch_final<-touch_final%>%tidyr::separate_wider_delim(Company,delim="_",names=c("Company","Status"),too_many='merge')%>%
+#   mutate(Status=ifelse(Status=='PERMIAN RESOURCES_NonOperated','NonOperated',
+#                        ifelse(Status=='PERMIAN RESOURCES_Operated','Operated',Status)))%>%
+#   mutate(Company=ifelse(Company=='CDEV','PERMIAN RESOURCES',Company))
+
+
+#write_sf(touch_final,'touching_FINAL.shp')
+
+
+
+eer_intersect<-st_intersection(st_buffer(acreage,dist=0),st_buffer(dsu,dist=20))
+
+
+
+
+
+eer_intersect<-eer_intersect%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(area=area/43560)%>%
+  filter(area>5)%>%
+  group_by(Company)%>%
+  summarise(geometry=st_union(geometry))%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(acres=area/43560)%>%select(-area)
+
+
+
+#write_sf(eer_intersect,'intersect.shp')
+
+
+#intersect<-read_sf("intersect.shp")
+#adjacent<-read_sf("touching_FINAL.shp")
+
+full=rbind(eer_intersect%>%mutate(Source='intersect'),touch_final%>%mutate(Source='adjacent'))
+
+#write_sf(full,'DRM/TopOperatorsAdjOverlap/operator_adj_overlap_dsu.shp')
+
+#write.xlsx(st_drop_geometry(full),'DRM/TopOperatorsAdjOverlap/operator_adj_overlap_dsu.xlsx')
+
+
+acreage<-acreage%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(area=area/43560)%>%
+  filter(area>5)%>%
+  group_by(Company,Status)%>%
+  summarise(geometry=st_union(geometry))%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(acres=area/43560)%>%select(-area)
+
+
+#write_sf(acreage,'DRM/TopOperatorsAdjOverlap/acreage_aoi.shp')
+
+#write.xlsx(st_drop_geometry(acreage),'DRM/TopOperatorsAdjOverlap/acreage_aoi.xlsx')
+
+
+
+non_operated<-acreage%>%filter(Status=='NonOperated')
+
+non_op_full<-st_intersection(full,non_operated%>%select(Company,Status))
+non_op_full<-non_op_full%>%filter(Company==Company.1)
+non_op_full<-non_op_full%>%
+  group_by(Company,Source,Status)%>%
+  summarise(geometry=st_union(geometry))%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(acres=area/43560)%>%select(-area)
+
+
+operated_full<-acreage%>%filter(Status=='Operated')
+
+operated_full<-st_intersection(full,operated_full%>%select(Company,Status))
+operated_full<-operated_full%>%filter(Company==Company.1)
+operated_full<-operated_full%>%
+  group_by(Company,Source,Status)%>%
+  summarise(geometry=st_union(geometry))%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(acres=area/43560)%>%select(-area)
+
+
+full_by_status=rbind(operated_full,non_op_full)
+
+write_sf(st_buffer(full_by_status,dist=0),'existing_non_core_op_status.shp')
+write.xlsx(st_drop_geometry(full_by_status),'existing_non_core_op_status.xlsx')
+
+
+
+state_county <-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/Individual Work/DM Work_COP/Common Mapping Shapefiles/COUNTY.shp")
+state_county_clip=state_county%>%filter(CNAME %in% c('EDDY','LEA'))
+
+state_county_clip<-st_transform(state_county_clip,crs='+init=epsg:32039')
+
+outline=st_union(blk1blk2)
+bbox <- st_as_sfc(st_bbox(outline))
+bbox_centroid<-st_centroid(bbox)
+bbox_centroid<-st_as_sf(bbox_centroid)
+bbox<-st_segments(bbox)
+bbox<-st_as_sf(bbox)
+max_dist=as.numeric(max(st_distance(bbox_centroid,bbox)))
+
+square=buffer_square(bbox_centroid,max_dist*2)
+st_crs(square) <- "+init=epsg:32039"
+bbox<-st_as_sf(square)
+bbox<-st_bbox(bbox)
+
+
+state_county_clip<-st_intersection(state_county_clip,square)
+
+twn_rng<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/BD_ANALYST/F_AcrGIS/H_Shape_File_Library/TX Block and Section/nm_twn_rng.shp")
+
+cop_dsu_intersect<-st_intersection(cop_outline,dsu)
+
+
+
+
+output_maps<-function(i){
+  
+  full_filter=full%>%filter(Company==i)
+  
+  # full_filter=full%>%filter(grepl('DEVON|EOG|OCCIDENTAL|PERMIAN RESOURCES|COTERRA',Company))
+  # 
+  # acreage_core_lusk_int<-acreage_core_lusk_int%>%filter(grepl('DEVON|EOG|OCCIDENTAL|PERMIAN RESOURCES|COTERRA',Company))
+  # 
+  # write.xlsx(st_drop_geometry(full_filter),"core_lusk_adj_int.xlsx")
+  # 
+  #write_sf(full_filter%>%filter(Source=='intersect')%>%mutate(acres=as.numeric(st_area(geometry))/43560),'mewbourne_int.shp')
+  
+  p1=ggplot(full_filter)+
+     geom_sf(data=cop_outline,fill='lightgrey',color=NA)+
+     #geom_sf(data=cop_dsu_intersect,fill='#FEE631',color=NA)+
+     geom_sf(data=acreage%>%filter(Company==i),fill="#E4D9FF",color=NA)+
+     #geom_sf(data=acreage%>%filter(grepl('DEVON|EOG|OCCIDENTAL|PERMIAN RESOURCES|COTERRA',Company)),fill="#E4D9FF",color=NA)+
+    # geom_sf(data=acreage_core_lusk_int%>%filter(grepl('DEVON|EOG|OCCIDENTAL|PERMIAN RESOURCES|COTERRA',Company)),fill="#9c75fa",color=NA)+
+    #     geom_sf(aes(fill=Source),color=NA)+
+     geom_sf_text(data = state_county_clip, aes(label = CNAME), size = 3) +
+     geom_sf(data=blk1blk2,color='#FA80CB',fill=NA,linewidth=1.25)+
+    geom_sf(data=full_filter%>%filter(Source=='adjacent'),fill='#E50204',color=NA)+
+    geom_sf(data=full_filter%>%filter(Source=='intersect'),fill='#23AEEE',color=NA)+
+    #geom_sf(data=full_filter,aes(fill=Source),color=NA)+
+    geom_sf(data=twn_rng,fill=NA,color="black",linewidth=.25)+
+    geom_sf(data=dsu_poly,fill=NA,color='black',linewidth=1)+
+    geom_sf_text(data=twn_rng,aes(label = TWPRNG), size = 2, color = "black") +
+    theme_void()+
+    geom_sf(data=state_county,fill=NA,linewidth=1)+
+    theme( plot.margin = margin(0.3, 0.3, 0.3, 0.3, "cm"), plot.background = element_rect(
+      colour = "black",
+      size = 1,
+      fill='white'
+    ),legend.position = '')+
+    scale_fill_manual(values=c('#E50204','#23AEEE'))+
+    coord_sf(
+      xlim = c(bbox[1], bbox[3]),
+      ylim = c(bbox[2], bbox[4]),
+      expand = T,
+      lims_method = 'box'
+    )+
+    ggtitle(i)+
+    labs(color="")+
+    guides(color = guide_legend(order=1,nrow=2),fill=guide_legend(order=2,nrow=1))
+  
+  ggsave(plot=p1,paste('maps/','existing_non_core_dsu_',i,'.png',sep=""),width=7.1,height=7.67)
+  
+  
+}
+
+lapply(unique(full$Company),output_maps)
+
+
+
+
+
+
+extend_polygons_final<-data.frame()
+
+
+extend_polygons_fctn<- function(i){
+
+polygon_sf <-dsu_poly%>%filter(row_num==i)
+# Compute bounding box
+bbox <- st_bbox(polygon_sf)
+
+# Determine primary axis (lengthwise) and extend by 5000 feet
+if ((bbox["xmax"] - bbox["xmin"]) > (bbox["ymax"] - bbox["ymin"])) {
+  # Extend in the X direction (lengthwise)
+  bbox["xmin"] <- bbox["xmin"] - 4700  
+  bbox["xmax"] <- bbox["xmax"] + 4700
+} else {
+  # Extend in the Y direction (lengthwise)
+  bbox["ymin"] <- bbox["ymin"] - 4700
+  bbox["ymax"] <- bbox["ymax"] + 4700
+}
+
+# Create an extended bounding box as a new polygon
+extended_rect <- st_polygon(list(matrix(
+  c(
+    bbox["xmin"], bbox["ymin"],
+    bbox["xmax"], bbox["ymin"],
+    bbox["xmax"], bbox["ymax"],
+    bbox["xmin"], bbox["ymax"],
+    bbox["xmin"], bbox["ymin"]
+  ),
+  ncol = 2, byrow = TRUE
+)))
+
+# Convert extended box to sf object
+extended_sf <- st_sf(geometry = st_sfc(extended_rect), crs = st_crs(polygon_sf))
+
+# Merge original polygon with the extended area
+extended_polygon <- st_union(polygon_sf, extended_sf)
+extended_polygon <-st_buffer(extended_polygon,dist=0)
+
+
+extended_polygon$DSU_ID=i
+extend_polygons_final<<-rbind(extend_polygons_final,extended_polygon)
+
+}
+
+
+lapply(unique(dsu_poly$row_num),extend_polygons_fctn)
+
+extend_polygons_final_original=extend_polygons_final
+extend_polygons_final<-st_difference(extend_polygons_final,st_union(st_buffer(dsu_poly,dist=50)))
+
+
+
+acreage_extend_dsu_intersect<- st_intersection(acreage,extend_polygons_final)
+
+acreage_extend_dsu_intersect<- acreage_extend_dsu_intersect%>%
+  group_by(Company)%>%
+  summarise(geometry=st_union(geometry))
+
+acreage_extend_dsu_intersect$Ext_Adj='Extend_Adj'
+
+full_by_status_int<-st_intersection(full_by_status,acreage_extend_dsu_intersect)
+full_by_status_int<-full_by_status_int%>%filter(Company==Company.1)%>%select(-Company.1)
+full_by_status_int<-full_by_status_int%>%filter(Source=='adjacent')
+full_by_status_int$Source='Direct_Adjacent'
+
+ggplot(dsu_poly)+
+  #geom_sf()+
+  geom_sf(data=full_by_status_int,color='green',fill=NA)+
+  theme_minimal()
+
+
+full_by_status_int<-full_by_status_int%>%
+  group_by(Company,Source,Status)%>%
+  summarise(geometry=st_union(geometry))%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(acres=area/43560)%>%select(-area)
+
+i='DEVON'
+
+
+final_adj_direct_df=data.frame()
+
+remove_adj_fctn=function(i){
+
+  full_by_status_filter<-full_by_status%>%filter(Company==i)%>%filter(Source=='adjacent')
+  
+  union_sf=full_by_status_int%>%filter(Company==i)
+  union_sf=st_union(st_buffer(union_sf,dist=0))
+  full_by_status_filter2=st_difference(full_by_status_filter,union_sf)
+  
+  final_adj_direct_df<<-rbind(final_adj_direct_df,full_by_status_filter2)
+
+}
+
+lapply(unique(full_by_status$Company), remove_adj_fctn)
+
+
+intersect_df<-full_by_status%>%filter(Source=='intersect')
+
+final_table_df<-rbind(intersect_df,final_adj_direct_df)
+
+final_table_df<-rbind(final_table_df,full_by_status_int)
+
+
+final_table_df<-final_table_df%>%
+  group_by(Company,Source,Status)%>%
+  summarise(geometry=st_union(geometry))%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(acres=area/43560)%>%select(-area)
+
+
+  
+  
+
+final_table_df_dsu<-st_intersection(final_table_df,extend_polygons_final_original%>%select(DSU_ID))
+
+final_table_df_dsu<-final_table_df_dsu%>%ungroup()%>%
+  mutate(acres=as.numeric(st_area(geometry))/43560)%>%
+  filter(acres>5)
+
+final_table_df<- st_difference(final_table_df,st_union(st_buffer(final_table_df_dsu,dist=25)))
+
+
+
+
+final_table_df<-st_intersection(final_table_df,st_transform(sections,st_crs(final_table_df))%>%select(geometry))
+final_table_df<-final_table_df%>%
+  mutate(acres=as.numeric(st_area(geometry))/43560)%>%filter(acres>20)
+
+
+shp1 <- final_table_df
+shp2 <- extend_polygons_final
+
+shp2 <- st_transform(shp2, st_crs(shp1))
+
+dist_matrix <- st_distance(shp1, shp2)
+
+closest_indices <- apply(dist_matrix, 1, which.min)  # 1-based index
+
+closest_ids <- shp2$DSU_ID[closest_indices]
+
+shp1$DSU_ID <- closest_ids
+
+shp1<-shp1%>%
+  mutate(acres=as.numeric(st_area(geometry))/43560)%>%filter(acres>1)
+
+
+  
+
+final_table_df_dsu<-final_table_df_dsu%>%
+  group_by(Company,Source,Status,DSU_ID)%>%
+  summarise(geometry=st_union(st_buffer(geometry,dist=0)))%>%
+  mutate(acres=as.numeric(st_area(geometry))/43560)
+
+
+master_table<-rbind(final_table_df_dsu,shp1)
+
+st_drop_geometry(master_table)%>%group_by(Company)%>%
+  summarise(acres=sum(acres))%>%
+  arrange(desc(acres))
+
+master_table<-master_table%>%
+  group_by(Company,Source,Status,DSU_ID)%>%
+  summarise(geometry=st_union(st_buffer(geometry,dist=0)))%>%
+mutate(acres=as.numeric(st_area(geometry))/43560)
+
+
+write.xlsx(st_drop_geometry(master_table),'Existing_Company_Source_Status_DSU_ID.xlsx')
+write_sf(master_table,'Existing_Company_Source_Status_DSU_ID.shp')
+
+
+CHARTS_FCTN<-function(i){
+
+dsu_chart_df<- st_drop_geometry(master_table)%>%filter(Company==i)
+dsu_chart_df<-dsu_chart_df%>%group_by(DSU_ID)%>%mutate(MaxAcres=sum(acres))
+dsu_chart_df$DSU_ID<-fct_reorder(as.factor(dsu_chart_df$DSU_ID),-dsu_chart_df$MaxAcres)
+
+dsu_chart_df_labels<-dsu_chart_df%>%group_by(DSU_ID,MaxAcres)%>%distinct(DSU_ID,.keep_all=T)
+
+
+cols <- c("adjacent" = "#E50204", "Direct_Adjacent" = "orange", "intersect" = "#23AEEE", "10" = "orange")
+
+ggplot(dsu_chart_df)+
+  geom_bar(aes(DSU_ID,acres,fill=Source),color=NA,position='stack',stat='identity')+
+  #geom_bar(data=dsu_chart_df%>%filter(Core_Lusk=='Core Lusk'),aes(DSU_ID,acres,fill=Source),color='black',position='stack',stat='identity')+
+  geom_text(data=dsu_chart_df_labels,aes(DSU_ID,MaxAcres+30,label=scales::comma(round(MaxAcres,0))))+
+  theme(
+    panel.background = element_rect(fill = "#F2F2F2", color = NA),
+    plot.background = element_rect(fill = "#F2F2F2", color = NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size=14),
+    axis.text.y = element_text(size=12),
+    axis.title.x = element_text( size = 14),
+    axis.title.y = element_text( size = 14),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.background = element_rect(fill = "#F2F2F2", color = NA),
+    legend.key = element_rect(fill = "#F2F2F2", color = NA)
+  )+
+  xlab('DSU ID')+ylab("Acres")+
+  scale_y_continuous(labels=scales::comma)+
+  scale_fill_manual(values=cols)
+  
+ggsave(plot=last_plot(),paste("charts/existing_",i,'_DSU.png',sep=""),width=13.33,height=5.7)
+}
+
+lapply(unique(master_table$Company),CHARTS_FCTN)
+
+
+
+
+
+###########EXISTING + NEW DSUS----
+
+cop_outline<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/__SOURCE FILES/COP_LEASE_LAYER/cop.shp")
+
+dsu<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/DIVESTITURES/EDDY COUNTY 2025/DSU SHAPEFILES/NON CORE DSUs/NON CORE DSUs 05 27 25.shp")
+dsu<-st_zm(dsu)
+dsu<-dsu%>%mutate(row_num=row_number())
+dsu_poly<-dsu%>%group_by(row_num)%>%
+  summarise(geometry=st_union(geometry))%>%st_cast('POLYGON')
+
+dsu<-left_join(dsu_poly,st_drop_geometry(dsu))
+
+dsu<-st_union(dsu)
+
+blk1<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/DIVESTITURES/EDDY COUNTY 2025/ABK/Shapefiles/Block 1 & 2 AOIs/BLK_1/BLK_1.shp")
+blk1<-blk1%>%mutate(id='block1')%>%select(id)
+blk2<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/DIVESTITURES/EDDY COUNTY 2025/ABK/Shapefiles/Block 1 & 2 AOIs/BLK_2_AOI/BLK_2_AOI.shp")
+blk2<-blk2%>%mutate(id='block2')%>%select(id)
+
+blk1blk2=rbind(blk1,blk2)
+
+state_county <-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/Individual Work/DM Work_COP/Common Mapping Shapefiles/COUNTY.shp")
+
+
+state_county_clip=state_county
+
+state_county_clip<-st_transform(state_county_clip,st_crs(dsu))
+
+NDB<- state_county_clip%>%filter(CNAME %in% c("EDDY","LEA"))
+
+
+acreage<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/Permian Inventory CoS Join/Op_Non_Unknown_Acreage/Combined_Acreage/Combined_Acreage.shp")
+
+acreage<-st_intersection(acreage,NDB)
+
+acreage<-acreage%>%mutate(Company=ifelse(grepl('APA CORP',Company),'PERMIAN RESOURCES',Company))
+
+sort(unique(acreage$Company))
+
+sections<- read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/Permian Inventory/Op_Non_Unknown_Acreage/sections_grid/sections_rowId.shp")
+
+acreage<-st_intersection(st_buffer(acreage,dist=0),st_transform(blk1blk2,st_crs(acreage)))
+
+acreage_sec<-st_intersection(acreage,st_transform(sections,st_crs(acreage)))
+
+acreageOrig=acreage
+
+cop<-dsu
+
+sections<-st_transform(sections,st_crs(acreage))
+
+
+end_df<-data.frame()
+
+
+i='MEWBOURNE OIL'
+
+touching_fctn<-function(i){
+  endeavor<-acreage%>%filter(Company==i)
+  
+  endeavor_int<- st_intersection(sections,endeavor)
+  
+  endeavor_int<- endeavor_int%>%mutate(area=as.numeric(st_area(geometry))/43560)%>%filter(area>40)
+  
+  endeavor_int<- sections%>%filter(row_id %in% c(endeavor_int$row_id))
+  
+  
+  cop_int<- st_intersection(sections,st_buffer(cop,dist=0))
+  cop_int<-st_buffer(cop_int,dist=0)
+  
+  cop_int<- cop_int%>%mutate(area=as.numeric(st_area(geometry))/43560)%>%filter(area>40)
+  
+  cop_int<- sections%>%filter(row_id %in% c(cop_int$row_id))
+  
+  
+  
+  cop_int<- cop_int%>%mutate(row_id=row_number())
+  endeavor_int<- endeavor_int%>%mutate(row_id=row_number())
+  
+  touching_list=data.frame(st_relate(cop_int,endeavor_int, pattern = "****1****")) # sides, not corners, internals
+  
+  endeavor_touching<- endeavor_int%>%filter(row_id %in% c(touching_list$col.id))
+  
+  combined<-rbind(st_as_sf(cop)%>%rename(geometry=x)%>%select(geometry),endeavor%>%select(geometry))
+  
+  endeavor_touching<- st_intersection(st_buffer(endeavor_touching,dist=0),st_buffer(combined,dist=0))
+  
+  endeavor_touching<-st_buffer(endeavor_touching,dist=0)
+  
+  endeavor_touching<- st_difference(endeavor_touching,st_buffer(cop,dist=0))
+  endeavor_touching<-st_buffer(endeavor_touching,dist=0)
+  
+  endeavor_touching<- st_transform(endeavor_touching,st_crs(endeavor))
+  
+  endeavor_touching<-endeavor_touching%>%mutate(Company=i)
+  end_df<-rbind(end_df,endeavor_touching)
+  
+  end_df<<-end_df
+  print(i)
+  
+}
+
+lapply(unique(acreage$Company),touching_fctn)
+
+
+touch_final<- end_df%>%mutate(id_check=row_number())
+
+within=st_is_within_distance(st_centroid(touch_final),cop, dist = 2800)
+
+within2=data.frame(within)
+
+
+
+
+touch_final<-touch_final%>%filter(id_check %in% c(within2$row.id))
+
+
+touch_final<-touch_final%>%
+  group_by(Company)%>%
+  summarise(geometry=st_union(geometry))%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(acres=area/43560)%>%select(-area)
+
+# touch_final<-touch_final%>%tidyr::separate_wider_delim(Company,delim="_",names=c("Company","Status"),too_many='merge')%>%
+#   mutate(Status=ifelse(Status=='PERMIAN RESOURCES_NonOperated','NonOperated',
+#                        ifelse(Status=='PERMIAN RESOURCES_Operated','Operated',Status)))%>%
+#   mutate(Company=ifelse(Company=='CDEV','PERMIAN RESOURCES',Company))
+
+
+#write_sf(touch_final,'touching_FINAL.shp')
+
+
+
+eer_intersect<-st_intersection(st_buffer(acreage,dist=0),st_buffer(dsu,dist=20))
+
+
+
+
+
+eer_intersect<-eer_intersect%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(area=area/43560)%>%
+  filter(area>5)%>%
+  group_by(Company)%>%
+  summarise(geometry=st_union(geometry))%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(acres=area/43560)%>%select(-area)
+
+
+
+#write_sf(eer_intersect,'intersect.shp')
+
+
+#intersect<-read_sf("intersect.shp")
+#adjacent<-read_sf("touching_FINAL.shp")
+
+full=rbind(eer_intersect%>%mutate(Source='intersect'),touch_final%>%mutate(Source='adjacent'))
+
+#write_sf(full,'DRM/TopOperatorsAdjOverlap/operator_adj_overlap_dsu.shp')
+
+#write.xlsx(st_drop_geometry(full),'DRM/TopOperatorsAdjOverlap/operator_adj_overlap_dsu.xlsx')
+
+
+acreage<-acreage%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(area=area/43560)%>%
+  filter(area>5)%>%
+  group_by(Company,Status)%>%
+  summarise(geometry=st_union(geometry))%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(acres=area/43560)%>%select(-area)
+
+
+#write_sf(acreage,'DRM/TopOperatorsAdjOverlap/acreage_aoi.shp')
+
+#write.xlsx(st_drop_geometry(acreage),'DRM/TopOperatorsAdjOverlap/acreage_aoi.xlsx')
+
+
+
+non_operated<-acreage%>%filter(Status=='NonOperated')
+
+non_op_full<-st_intersection(full,non_operated%>%select(Company,Status))
+non_op_full<-non_op_full%>%filter(Company==Company.1)
+non_op_full<-non_op_full%>%
+  group_by(Company,Source,Status)%>%
+  summarise(geometry=st_union(geometry))%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(acres=area/43560)%>%select(-area)
+
+
+operated_full<-acreage%>%filter(Status=='Operated')
+
+operated_full<-st_intersection(full,operated_full%>%select(Company,Status))
+operated_full<-operated_full%>%filter(Company==Company.1)
+operated_full<-operated_full%>%
+  group_by(Company,Source,Status)%>%
+  summarise(geometry=st_union(geometry))%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(acres=area/43560)%>%select(-area)
+
+
+full_by_status=rbind(operated_full,non_op_full)
+
+write_sf(st_buffer(full_by_status,dist=0),'existing_non_core_op_status.shp')
+write.xlsx(st_drop_geometry(full_by_status),'existing_non_core_op_status.xlsx')
+
+
+
+state_county <-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/Individual Work/DM Work_COP/Common Mapping Shapefiles/COUNTY.shp")
+state_county_clip=state_county%>%filter(CNAME %in% c('EDDY','LEA'))
+
+state_county_clip<-st_transform(state_county_clip,crs='+init=epsg:32039')
+
+outline=st_union(blk1blk2)
+bbox <- st_as_sfc(st_bbox(outline))
+bbox_centroid<-st_centroid(bbox)
+bbox_centroid<-st_as_sf(bbox_centroid)
+bbox<-st_segments(bbox)
+bbox<-st_as_sf(bbox)
+max_dist=as.numeric(max(st_distance(bbox_centroid,bbox)))
+
+square=buffer_square(bbox_centroid,max_dist*2)
+st_crs(square) <- "+init=epsg:32039"
+bbox<-st_as_sf(square)
+bbox<-st_bbox(bbox)
+
+
+state_county_clip<-st_intersection(state_county_clip,square)
+
+twn_rng<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/BD_ANALYST/F_AcrGIS/H_Shape_File_Library/TX Block and Section/nm_twn_rng.shp")
+
+cop_dsu_intersect<-st_intersection(cop_outline,dsu)
+
+
+
+
+#Output Maps----
+lapply(unique(full$Company),output_maps)
+
+
+#Extend Polygons----
+extend_polygons_final<-data.frame()
+lapply(unique(dsu_poly$row_num),extend_polygons_fctn)
+
+
+extend_polygons_final_original=extend_polygons_final
+extend_polygons_final<-st_difference(extend_polygons_final,st_union(st_buffer(dsu_poly,dist=50)))
+
+
+
+acreage_extend_dsu_intersect<- st_intersection(acreage,extend_polygons_final)
+
+acreage_extend_dsu_intersect<- acreage_extend_dsu_intersect%>%
+  group_by(Company)%>%
+  summarise(geometry=st_union(geometry))
+
+acreage_extend_dsu_intersect$Ext_Adj='Extend_Adj'
+
+full_by_status_int<-st_intersection(full_by_status,acreage_extend_dsu_intersect)
+full_by_status_int<-full_by_status_int%>%filter(Company==Company.1)%>%select(-Company.1)
+full_by_status_int<-full_by_status_int%>%filter(Source=='adjacent')
+full_by_status_int$Source='Direct_Adjacent'
+
+
+full_by_status_int<-full_by_status_int%>%
+  group_by(Company,Source,Status)%>%
+  summarise(geometry=st_union(geometry))%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(acres=area/43560)%>%select(-area)
+
+
+
+final_adj_direct_df=data.frame()
+lapply(unique(full_by_status$Company), remove_adj_fctn)
+
+
+intersect_df<-full_by_status%>%filter(Source=='intersect')
+
+final_table_df<-rbind(intersect_df,final_adj_direct_df)
+
+final_table_df<-rbind(final_table_df,full_by_status_int)
+
+
+final_table_df<-final_table_df%>%
+  group_by(Company,Source,Status)%>%
+  summarise(geometry=st_union(geometry))%>%
+  mutate(area=as.numeric(st_area(geometry)))%>%
+  mutate(acres=area/43560)%>%select(-area)
+
+
+
+final_table_df_dsu<-st_intersection(final_table_df,extend_polygons_final_original%>%select(DSU_ID))
+
+final_table_df_dsu<-final_table_df_dsu%>%ungroup()%>%
+  mutate(acres=as.numeric(st_area(geometry))/43560)%>%
+  filter(acres>5)
+
+final_table_df<- st_difference(final_table_df,st_union(st_buffer(final_table_df_dsu,dist=25)))
+
+
+
+
+final_table_df<-st_intersection(final_table_df,st_transform(sections,st_crs(final_table_df))%>%select(geometry))
+final_table_df<-final_table_df%>%
+  mutate(acres=as.numeric(st_area(geometry))/43560)%>%filter(acres>20)
+
+
+shp1 <- final_table_df
+shp2 <- extend_polygons_final
+
+shp2 <- st_transform(shp2, st_crs(shp1))
+
+dist_matrix <- st_distance(shp1, shp2)
+
+closest_indices <- apply(dist_matrix, 1, which.min)  # 1-based index
+
+closest_ids <- shp2$DSU_ID[closest_indices]
+
+shp1$DSU_ID <- closest_ids
+
+shp1<-shp1%>%
+  mutate(acres=as.numeric(st_area(geometry))/43560)%>%filter(acres>1)
+
+
+
+
+final_table_df_dsu<-final_table_df_dsu%>%
+  group_by(Company,Source,Status,DSU_ID)%>%
+  summarise(geometry=st_union(st_buffer(geometry,dist=0)))%>%
+  mutate(acres=as.numeric(st_area(geometry))/43560)
+
+
+master_table<-rbind(final_table_df_dsu,shp1)
+
+st_drop_geometry(master_table)%>%group_by(Company)%>%
+  summarise(acres=sum(acres))%>%
+  arrange(desc(acres))
+
+master_table<-master_table%>%
+  group_by(Company,Source,Status,DSU_ID)%>%
+  summarise(geometry=st_union(st_buffer(geometry,dist=0)))%>%
+  mutate(acres=as.numeric(st_area(geometry))/43560)
+
+
+write.xlsx(st_drop_geometry(master_table),'All_Company_Source_Status_DSU_ID.xlsx')
+write_sf(master_table,'All_Company_Source_Status_DSU_ID.shp')
+
+
+lapply(unique(master_table$Company),CHARTS_FCTN)
+
+
+
+donut_df=st_drop_geometry(master_table)%>%filter(Company=='DEVON')%>%group_by(Source)%>%
+  summarise(acres=sum(acres))%>%
+mutate(
+  Source = str_replace_all(Source, "_", " "),
+  Source = str_to_title(Source)                
+)
+
+
+p1
+x=rbind(p1,p1)
+
+
+
+donut_df <- donut_df %>%
+  mutate(
+    fraction = acres / sum(acres),
+    ymax = cumsum(fraction),
+    ymin = c(0, head(ymax, n = -1)),
+    label_pos = (ymax + ymin) / 2,
+    label = paste0(Source, "\n", round(fraction * 100), "%")
+  )
+
+custom_colors1 <- c(
+  "Direct Adjacent" = "red",  # Blue
+  "Adjacent" = "#FFC000",         # Green
+  "Intersect" = "#00B0F0"          # Yellow
+)
+
+# Plot donut chart
+ggplot(donut_df, aes(ymax = ymax, ymin = ymin, xmax = 4, xmin = 3, fill = Source)) +
+  geom_rect(color='#F2F2F2',width=1,size=2) +
+  coord_polar(theta = "y") +
+  xlim(c(2, 4)) +  # Adjust for donut hole
+  theme_void() +   # Clean theme
+  theme(legend.position = "bottom",legend.text = element_text(size=12),
+        plot.background = element_rect(fill = "#F2F2F2", color = NA),  # Entire plot background
+        panel.background = element_rect(fill = "#F2F2F2", color = NA)) +
+  guides(fill = guide_legend(title = NULL))+
+  geom_text(aes(x = 3.5, y = label_pos, label = scales::comma(acres)), color = "black") +
+  scale_fill_manual(values = custom_colors1)
+
+ggsave(plot=last_plot(),paste('maps/','existing_non_core_dsu_donut_',i,'.png',sep=""),width=3.55,height=2.53)
+
+
+
+
+pie_df=st_drop_geometry(master_table)%>%filter(Company=='DEVON')%>%group_by(Status)%>%
+  summarise(acres=sum(acres))
+
+pie_df <-pie_df %>%
+  mutate(
+    fraction = acres / sum(acres),
+    ymax = cumsum(fraction),
+    ymin = c(0, head(ymax, n = -1)),
+    label_pos = (ymax + ymin) / 2,
+    label = paste0(Status, "\n", round(fraction * 100), "%")
+  )
+
+custom_colors <- c(
+  "Operated" = "#27FFFA", 
+  "NonOperated" = "#9181F7")
+
+
+
+# Plot donut chart
+ggplot(pie_df, aes(ymax = ymax, ymin = ymin, xmax = 4, xmin = 3, fill = Status)) +
+  geom_rect(color='#F2F2F2',width=1,size=2) +
+  coord_polar(theta = "y") +
+  theme_void() +   # Clean theme
+  theme(legend.position = "bottom",legend.text = element_text(size=12),
+        plot.background = element_rect(fill = "#F2F2F2", color = NA),  # Entire plot background
+        panel.background = element_rect(fill = "#F2F2F2", color = NA)) +
+  guides(fill = guide_legend(title = NULL))+
+  geom_text(aes(x = 3.5, y = label_pos, label = scales::comma(acres)), color = "black") +
+  scale_fill_manual(values = custom_colors)
+
+ggsave(plot=last_plot(),paste('maps/','existing_non_core_dsu_pie_',i,'.png',sep=""),width=3.55,height=2.53)
+
+
+x= st_intersection(st_make_grid(state_county[1,],cellsize = .00515),state_county[1,])
+x=st_as_sf(x)%>%mutate(row=row_number())
+
+#wells<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/__SOURCE FILES/Well_Sticks_Zone/BD_ALL_WELLS.shp")
+wells_int<-st_intersection(wells,st_transform(x,st_crs(wells)))
+wells_int<-st_drop_geometry(wells_int)%>%group_by(row)%>%summarise(count=max(row_number()))
+
+x=left_join(x,wells_int)
+
+ggplot(x)+geom_sf(aes(fill=count),color=NA)+
+  geom_sf(data=state_county[1,],fill=NA)+
+  theme_minimal()+
+  scale_fill_viridis_c()
+  
