@@ -1,0 +1,239 @@
+library(sf)
+library(tidyverse)
+library(tidyr)
+
+sf::sf_use_s2(FALSE)
+
+acreage<- read_sf("env_acreage/env_shp-OperatorLand-Operators-8ee0c_2025-01-30.shp")
+
+acreage <- st_transform(acreage,  "+init=epsg:32039")
+
+
+
+
+basin<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/Individual Work/DM Work_COP/Common Mapping Shapefiles/permian_basin_polygon.shp")
+basin <- st_transform(basin,  "+init=epsg:32039")
+
+
+sections<- read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/BD_ANALYST/F_AcrGIS/H_Shape_File_Library/TX Block and Section/tx_nm_sec.shp")
+
+X=sectionsS%>%select(STATE,SEC,TX_SECT,TWP,TDIR,RNG,RDIR,TX_BLK,TX_SURVEY)
+
+
+sections<-sections%>%mutate(SEC_NM_TX=ifelse(is.na(STATE) | STATE != 'NM', TX_SECT, SEC),
+                            LEGAL= ifelse(is.na(STATE) | STATE != 'NM',paste(TX_SECT,TX_BLK,TX_SURVEY,sep="-"),
+                                          paste(SEC,paste(TWP,TDIR,sep=""),paste(RNG,RDIR,sep=""),sep="-")))%>%
+  select(SEC_NM_TX,LEGAL)%>%
+  mutate(row_id=row_number())
+
+sections <- st_transform(sections,  "+init=epsg:32039")
+
+sections<-st_intersection(sections,basin)
+
+sticks<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/__SOURCE FILES/Well_Sticks_Zone/BD_ALL_WELLS.shp")
+
+sticks <- st_transform(sticks,  "+init=epsg:32039")
+
+cop<-read_sf("//Conoco.net/ho_shared/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/__SOURCE FILES/COP_LEASE_LAYER/cop_leases_ex_MRO.shp")
+
+cop<-cop%>%mutate(company='cop')%>%select(company)
+
+cop <- st_transform(cop,  "+init=epsg:32039")
+cop<-st_intersection(st_buffer(cop,dist=0),basin)
+
+mro<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/__SOURCE FILES/COP_LEASE_LAYER/hmro_leases_01132025.shp")
+mro<-mro%>%mutate(company='mro')%>%select(company)
+mro <- st_transform(mro,  "+init=epsg:32039")
+mro<-st_intersection(st_buffer(mro,dist=0),basin)
+
+cop_mro<-rbind(cop,mro)
+
+cop_mro<-st_as_sf(st_union(st_buffer(cop_mro,dist=10)))
+
+cop_mro<-cop_mro%>%rename(geometry=x)
+
+st_geometry(cop_mro) <- "geometry"
+
+###remove
+#cop_mro<-mro
+
+cop_mro<-st_intersection(cop_mro,basin)
+
+cop_int<- st_intersection(sections,st_buffer(cop_mro,dist=0))
+cop_int<-st_buffer(cop_int,dist=0)
+
+cop_int<- cop_int%>%mutate(area=as.numeric(st_area(geometry))/43560)%>%filter(area>40)
+
+cop_int<- sections%>%filter(row_id %in% c(cop_int$row_id))
+
+cop_int<- cop_int%>%mutate(row_id=row_number())
+
+
+
+company_touch_int_final<-data.frame()
+
+
+
+acreage<-acreage%>%rename(Company=ENV_Op)
+
+
+acreage<-acreage%>%filter(!grepl('UNITED|MINERAL|MINERALS|PARTNERS|INVESTMENT|INVESTMENTS|
+                                   LP|ROYALTY|ROYALTIES|TRUST|FEDERAL LAND|WATER|MIDSTREAM|
+                                   UNIVERSITY LAND|POTASH|SINOCHEM|CAPITAL|HOLDINGS',Company,ignore.case=T))
+
+
+
+
+acreage_filter<-acreage%>%group_by(Company)%>%
+  summarise(geometry=st_union(st_buffer(geometry,dist=0)))
+
+acreage_filter<-acreage_filter%>%mutate(acres=as.numeric(st_area(geometry))/43560)%>%st_drop_geometry()%>%
+  filter(acres>25000)%>%arrange(desc(acres))
+
+acreage<-acreage%>%filter(Company %in% c(acreage_filter$Company))
+
+i='MATADOR RESOURCES'
+
+
+
+trade_mapping_function<-function(i){
+  company_filter<-acreage%>%filter(Company==i)
+  
+  company_filter_int<- st_intersection(sections,st_buffer(company_filter,dist=0))
+  
+  company_filter_int<- company_filter_int%>%mutate(area=as.numeric(st_area(geometry))/43560)%>%filter(area>40)
+  
+  company_filter_int<- sections%>%filter(row_id %in% c(company_filter_int$row_id))
+  
+  company_filter_int<- company_filter_int%>%mutate(row_id=row_number())
+  
+  touching_list=data.frame(st_relate(cop_int,company_filter_int, pattern = "****1****")) # sides, not corners, internals
+  
+  company_filter_touching<- company_filter_int%>%filter(row_id %in% c(touching_list$col.id))
+  
+  int_check=st_intersection(st_buffer(company_filter,dist=0),st_union(cop_mro))
+  
+  if(nrow(company_filter_touching)==0 & nrow(int_check)==0){
+    print('skip')}
+  else if(nrow(int_check)>0 &  nrow(company_filter_touching)==0){
+    company_touch_int<-st_intersection(company_touch_int,sections%>%select(LEGAL,SEC_NM_TX,row_id))
+    
+    company_touch_int<-left_join(company_touch_int,sticks_join_sec_df)
+    
+    
+    
+    company_touch_int<-company_touch_int%>%mutate(acres=as.numeric(st_area(geometry))/43560)%>%filter(acres>20)
+    
+    company_touch_int<-st_buffer(company_touch_int,dist=1)
+    
+    company_touch_int<-company_touch_int%>%mutate(count=ifelse(is.na(count),0,count))
+    
+    company_touch_int<-company_touch_int%>%mutate(Company=i)
+    
+    company_touch_int_final<<-rbind(company_touch_int_final,company_touch_int)
+    }
+  else{
+  
+  combined<-rbind(cop_mro%>%select(geometry),company_filter%>%select(geometry))
+  
+  company_filter_touching<- st_intersection(st_buffer(company_filter_touching,dist=1),st_buffer(combined,dist=1))
+  
+  company_filter_touching<- st_difference(company_filter_touching,st_union(st_buffer(cop_mro,dist=0)))
+  company_filter_touching<-st_buffer(company_filter_touching,dist=0)
+  
+  company_filter_touching<- st_transform(company_filter_touching,st_crs(company_filter))
+  
+  company_filter_touching<-company_filter_touching%>%mutate(Company=i)
+  
+  touch_final<- company_filter_touching%>%mutate(id_check=row_number())
+  
+  within=st_is_within_distance(st_centroid(touch_final),cop_mro, dist = 2800)
+  
+  within2=data.frame(within)
+  
+  touch_final<-touch_final%>%filter(id_check %in% c(within2$row.id))
+  
+  touch_final<-touch_final%>%
+    group_by(Company)%>%
+    summarise(geometry=st_union(geometry))%>%
+    mutate(area=as.numeric(st_area(geometry)))%>%
+    mutate(area=area/43560)
+  
+  
+  
+  
+  company_int<-st_intersection(st_union(cop_mro),st_buffer(company_filter,dist=0))
+  
+  
+  company_touch_int<-rbind(st_as_sf(touch_final)%>%mutate(id='Adjacent')%>%select(id),st_as_sf(company_int)%>%rename(geometry=x)%>%mutate(id='Intersect')%>%select(id))
+  
+  
+  
+  sticks_int<-st_intersection(sticks,sections)
+  
+  sticks_int<-sticks_int%>%mutate(length_int=as.numeric(st_length(geometry)))%>%filter(length_int>2500)
+  
+  sticks_join_sec<-sticks%>%filter(UWI %in% c(sticks_int$UWI))
+  sticks_join_sec<-sticks_join_sec%>%select(UWI,zone)
+  
+  
+  
+  sticks_join_sec_df<-left_join(st_drop_geometry(sticks_join_sec),st_drop_geometry(sticks_int)%>%select(UWI,LEGAL,SEC_NM_TX,row_id,length_int))
+  
+  sticks_join_sec_df<-unique(sticks_join_sec_df)
+  
+  sticks_join_sec_df<-sticks_join_sec_df%>%group_by(LEGAL,SEC_NM_TX,zone,row_id)%>%summarise(count=max(row_number()))
+  
+  #sticks_join_sec_df=pivot_wider(sticks_join_sec_df,names_from = zone,values_from=count)
+  
+  company_touch_int= st_zm(company_touch_int)
+  
+  
+  company_touch_int<-st_intersection(company_touch_int,sections%>%select(LEGAL,SEC_NM_TX,row_id))
+  
+  company_touch_int<-left_join(company_touch_int,sticks_join_sec_df)
+  
+  
+  
+  company_touch_int<-company_touch_int%>%mutate(acres=as.numeric(st_area(geometry))/43560)%>%filter(acres>20)
+  
+  company_touch_int<-st_buffer(company_touch_int,dist=1)
+  
+  company_touch_int<-company_touch_int%>%mutate(count=ifelse(is.na(count),0,count))
+  
+  company_touch_int<-company_touch_int%>%mutate(Company=i)
+
+  company_touch_int_final<<-rbind(company_touch_int_final,company_touch_int)
+  
+  print(i)
+
+}
+}
+  
+company_touch_int_final<-data.frame()
+
+
+company_vector=acreage_filter$Company
+
+company_vector[c(1:3,5:150)]
+
+lapply(company_vector[c(1:3,5:150)],trade_mapping_function)
+
+
+company_touch_int_final<-company_touch_int_final%>%mutate(UniqueId=row_number())
+
+company_touch_int_final2<-st_drop_geometry(company_touch_int_final)%>%group_by(row_id,Company,LEGAL,id,zone)%>%
+                          distinct(row_id,Company,LEGAL,id,.keep_all=T)   
+
+
+company_touch_int_final2_sf<-company_touch_int_final %>% filter(UniqueId %in% c(company_touch_int_final2$UniqueId))
+
+
+company_touch_int_final2_sf<-company_touch_int_final2_sf%>%group_by(LEGAL,Company,row_id,id)%>%
+  mutate(SecPDPCnt= sum(count))
+  
+
+
+
+write.csv(st_drop_geometry(company_touch_int_final2_sf),'company_touch_int.csv')
+write_sf(company_touch_int_final2_sf,'company_touch_int.shp')
