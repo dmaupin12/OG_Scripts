@@ -1,0 +1,619 @@
+library(tidyverse)
+library(openxlsx)
+library(tigris)
+library(ggplot2)
+library(sf)
+library(scales)
+library(basemaps)
+library(officer)
+library(tidyr)
+
+
+
+production<-readRDS("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/__SOURCE FILES/ENV_PRD/spotfire_output/prod.rds")
+
+
+
+acreage<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/Permian Inventory CoS Join/Op_Non_Unknown_Acreage/Combined_Acreage/Combined_Acreage.shp")
+
+acreage <- st_transform(acreage,  crs = st_crs(3857))
+
+y='SDB'
+
+basin_legend=if(y=='NDB'){
+  c("left", "top")
+}else if(y=='SDB'){
+  c("left", 'bottom')
+}else if(y %yn% c('MBN','MBS')){
+  c('right','top')
+}
+
+
+position_legend=if(y=='NDB'){
+  c(.01,.99)
+}else if(y=='SDB'){
+  c(.01, .01)
+}else if(y %in% c('MBN','MBS')){
+  c(.99,.99)
+}
+
+
+
+
+
+cop<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/__SOURCE FILES/COP_LEASE_LAYER/cop.shp")
+cop <- st_transform(cop,  crs = st_crs(3857))
+
+bounding_box<-st_bbox(acreage%>%filter(grepl('DIAMONDBACK|COTERRA',Company)))
+
+int_touch_sf<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/__SOURCE FILES/Trade_Project/company_touch_int.shp")
+
+
+pdp<-read_sf('//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/__SOURCE FILES/Well_Sticks_Zone/BD_ALL_WELLS.shp')
+
+inventory<- read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/Permian Inventory CoS Join/CoS_Inventory_Join_Final/CoS_Inventory_Final_2.11.2025.shp")
+
+potash<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/BD_ANALYST/F_AcrGIS/BD_Base_Map/Shapes/Potash_Areas/Potash_Areas.shp")
+potash <- st_transform(potash,  crs = st_crs(3857))
+
+basin_lines<-read_sf("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/BD_ANALYST/F_AcrGIS/BD_Base_Map/Shapes/Basin_Outlines/Basin_Outlines.shp")
+
+state_county <- tigris::counties(state = c("Texas","New Mexico")) %>%
+  st_as_sf()
+
+state_county_clip=state_county
+
+state_county_clip<-st_transform(state_county_clip,st_crs(3857))
+
+
+spacing<-data.table::fread("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/Individual Work/DM Work_COP/Spacing/Final_Tables/Spacing_Output.csv")
+
+spacing<-spacing%>%
+  mutate(year_qtr = zoo::as.yearqtr(as.Date(Completion_Date))) %>%
+mutate(color=
+         ifelse(LandingZoneBulk =='WFMP A','#88FFFF',
+                ifelse(LandingZoneBulk =='WFMP B','#46B3FF',
+                       ifelse(LandingZoneBulk =='BS2S','#FF0241',
+                              ifelse(LandingZoneBulk =='AVLN','orange',
+                                     ifelse(LandingZoneBulk =='LSBY','#3BEA41',
+                                            ifelse(LandingZoneBulk =='MSBY','#99F46B',
+                                                   ifelse(LandingZoneBulk =='BS1S','#FF88FF',
+                                                          ifelse(LandingZoneBulk =='WFMP C','#0B3BFF',
+                                                                 ifelse(LandingZoneBulk =='JOMILL','#E0FB9E',
+                                                                        ifelse(LandingZoneBulk =='BRNT','#177B70',
+                                                                               ifelse(LandingZoneBulk =='WFMP D','#2F02BF',
+                                                                                      ifelse(LandingZoneBulk =='BS3C','turquoise',
+                                                                                             ifelse(LandingZoneBulk =='BS3S','#DF0006','grey'))))))))))))))%>%
+  mutate(LandingZoneBulk =ifelse(color=='grey','OTHER',LandingZoneBulk ))%>%
+  filter(LandingZoneBulk %in% c('WFMP A','WFMP B','LSBY','MSBY','WFMP D','WFMP C','AVLN','BS1S','BS2S','BS3S'))%>%
+  filter(Completion_Date>"2017-12-31")
+
+
+
+
+#i='BP'
+
+output_plots_fctn<-function(i){
+  
+  
+  
+  dir <- paste(paste(getwd(),'Companies',sep='/'),i,sep="/") 
+  
+  if (!dir.exists(dir)) dir.create(dir)
+  
+  
+  
+pdp_bar_100<-pdp%>%
+  #filter(Basin!='MB')%>%
+  filter(grepl(i,ENV_Opr),year>2015,!grepl("OUT_OF_DB_OUTLINE|OUT_OF_MB_OUTLINE|N.A",LndngZB))%>%
+  mutate(color=
+           ifelse(LndngZB=='WFMP A','#88FFFF',
+                  ifelse(LndngZB=='WFMP B','#46B3FF',
+                         ifelse(LndngZB=='BS2S','#FF0241',
+                                ifelse(LndngZB=='AVLN','#EECCFF',
+                                       ifelse(LndngZB=='LSBY','#3BEA41',
+                                              ifelse(LndngZB=='MSBY','#99F46B',
+                                                     ifelse(LndngZB=='BS1S','#FF88FF',
+                                                            ifelse(LndngZB=='WFMP C','#0B3BFF',
+                                                                   ifelse(LndngZB=='JOMILL','#E0FB9E',
+                                                                          ifelse(LndngZB=='BRNT','#177B70',
+                                                                                 ifelse(LndngZB=='WFMP D','#2F02BF',
+                                                                                        ifelse(LndngZB=='BS3C','turquoise',
+                                                                                               ifelse(LndngZB=='BS3S','#DF0006','grey'))))))))))))))%>%
+  mutate(LndngZB=ifelse(color=='grey','OTHER',LndngZB))%>%
+  group_by(year,Basin)%>%mutate(YearCount=max(row_number()))%>%
+  group_by(LndngZB,year,Basin)%>%mutate(ZoneCount=max(row_number()))
+
+color_mapping <- setNames(pdp_bar_100$color, pdp_bar_100$LndngZB)
+
+
+pdp_bar_100_label<-pdp_bar_100%>%select(year,Basin,LndngZB,ZoneCount,YearCount)%>%distinct(year,Basin,LndngZB,ZoneCount,YearCount)
+pdp_bar_100_label$percent_year<-round((pdp_bar_100_label$ZoneCount/pdp_bar_100_label$YearCount)*100,0)
+pdp_bar_100_label<-pdp_bar_100_label%>%filter(percent_year>4)
+
+
+ggplot(pdp_bar_100)+geom_bar(aes(year,fill=LndngZB),position  ='fill')+
+  theme_minimal()+facet_wrap(~Basin,nrow=1)+scale_y_continuous( labels= scales::percent)+
+  geom_text(data = pdp_bar_100_label, 
+            aes(x = year, y = ZoneCount / YearCount, label = paste0(percent_year, "%"), group = LndngZB),
+            position = position_fill(vjust = .5), color = "black",hjust=.5,size=3)+
+  scale_x_continuous(breaks = unique(pdp$year), labels = substr(unique(pdp$year), 3, 4))+
+  guides(fill = guide_legend(nrow = 1, label.position = "bottom")) +
+  theme(legend.position='bottom',legend.key.size = unit(.5, "cm"),
+        legend.text = element_text(hjust = 0.5,size=14),
+        panel.background = element_rect(fill = "white",color="white"),
+        plot.background = element_rect(fill = "white",color="white"),
+        strip.background = element_rect(fill = "white",color="white"),
+        axis.text.x = element_text(size = 14),  # Increase x-axis label size
+        axis.text.y = element_text(size = 14),
+        strip.text = element_text(size = 14))+
+  ylab("")+xlab("")+
+  scale_fill_manual(values = color_mapping) 
+
+
+ggsave(plot=last_plot(),filename = paste(dir,'/',i,"_trend",'.png',sep=""),width=12.96,height=6.1)
+
+
+pdp_bar_100_delta<- pdp_bar_100%>%filter(!is.na(OilDelt))
+
+ggplot(pdp_bar_100_delta) +
+  geom_hline(yintercept = 0, color = "black", size = .25,linetype='dashed') +  # Add this line
+    geom_boxplot(aes(x = as.factor(year), y = OilDelt, color = Basin), 
+               fill = NA, position = position_dodge(width = 0.75),size=.5) +  # Ensure boxplots don't overlap
+  scale_color_manual(values = c("DB" = "red", "MB" = "blue")) +  # Set colors for DB 
+  theme_minimal() +
+  theme(legend.position = 'bottom',
+        legend.key.size = unit(0.5, "cm"),
+        legend.text = element_text(hjust = 0.5,size=14),
+        panel.background = element_rect(fill = "white", color = "white"),
+        plot.background = element_rect(fill = "white", color = "white"),
+        strip.background = element_rect(fill = "white", color = "white"),
+        axis.text.x = element_text(size = 14),  # Increase x-axis label size
+        axis.text.y = element_text(size = 14),
+        strip.text = element_text(size = 14),
+        plot.caption = element_text(face = "italic")) +
+  ylab("Oil Percent Of Model") + 
+  xlab("")+
+  scale_x_discrete(breaks = unique(pdp_bar_100_delta$year), labels = substr(unique(pdp_bar_100_delta$year), 3, 4))+
+  scale_y_continuous( labels= scales::percent,limits = c(-1, 1))+
+  labs(caption = "Wells compared to BD regional type curves.")
+  
+  
+
+ggsave(plot=last_plot(),filename = paste(dir,'/',i,'_box','.png',sep=""),width=12.96,height=6.1)
+
+
+##cake plot
+inventory_filter<-inventory %>%
+  filter(grepl(i,Company))%>%
+  rename(reservoir=reservr)%>%
+  mutate(reservoir=ifelse(reservoir %in% c("WFMP A SH","WFMP A SD","BS3S"),"WFMP A/BS3 Tank",reservoir))
+
+
+inventory_filter$bins <- cut(inventory_filter$`CoS_$_WTI`, breaks=c(0,35,40,45,50,55,60,65,70,75,80,85,90,95,100,105,110,115,120))
+inventory_filter<-inventory_filter%>%filter(`CoS_$_WTI`<55.0001)
+
+#inventory_filter$bins<-fct_rev(inventory_filter$bins)
+inventory_total<- st_drop_geometry(inventory_filter)%>%ungroup()%>%arrange(`CoS_$_WTI`)%>%
+  group_by(bins)%>%
+  summarise(Count=max(row_number()))%>%ungroup()%>%mutate(CumCount=cumsum(Count))
+
+count_max=max(inventory_total$CumCount)
+
+#inventory_total$`CoS_$_WTI`<-fct_reorder(as.factor(inventory_total$`CoS_$_WTI`),inventory_total$Count)
+
+inventory_label<-inventory_total%>%group_by(bins)%>%filter(CumCount==max(CumCount))%>%
+  ungroup()%>%mutate(CumCount=((CumCount-lag(CumCount,default = 0))/2)+lag(CumCount,default = 0))
+
+inventory_total$right <- cumsum(inventory_total$Count) + 0*c(0:(nrow(inventory_total)-1))
+inventory_total$left <- inventory_total$right - inventory_total$Count 
+
+ggplot(inventory_total) + 
+  geom_rect(aes(xmin = left, xmax = right,ymin=0, ymax = Count, fill = bins))+ 
+  theme_minimal()+labs(x="Cumulative Inventory Count")+
+  geom_text(data=inventory_label,aes(x = CumCount, y = Count/2,label=bins),color="black",size=3)+
+  geom_text(data=inventory_label,aes(x = CumCount, y = Count,label=comma(Count)),color="black",size=5,vjust=-.5)+
+  annotate("text", x = count_max, y = max(inventory_total$Count) + 20, label = paste("Total:", comma(count_max)), vjust = -0.5,
+           hjust=1,
+           size=5,color='purple')+
+  theme(
+    text = element_text(size = 14),
+    legend.position = "top",
+    legend.key.size = unit(0.3, "cm"),
+    legend.title = element_blank(),
+    legend.justification="left",
+    legend.margin=margin(0,0,0,0),
+    legend.box.margin=margin(-1,-1,-1,-1),
+    axis.text.x = element_text(size = 14),  # Increase x-axis label size
+    axis.text.y = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    plot.caption = element_text(face = "italic")
+  ) +
+  scale_y_continuous(labels = scales::comma)+
+  scale_x_continuous(labels = scales::comma)+
+  guides(fill = guide_legend(reverse = F))+
+  scale_fill_manual(values=c('darkgreen','#32a852',"darkorange",'#d61515','darkred','lightgrey','grey'))+
+  ylim(0,max(inventory_total$Count)+20)+
+  ylab("Count")+
+  labs(caption = "Mid Cycle WTI CoS: 2024 AFEs.")
+
+
+ggsave(plot=last_plot(),filename = paste(dir,'/',i,'_cake','.png',sep=""),width=12.96,height=6.1)
+
+##Acreage Map
+
+acreage_f<-acreage%>%filter(grepl(i,Company))
+acreage_f <- st_transform(acreage_f,  crs = st_crs(3857))
+
+int_touch_sf_f<- int_touch_sf%>%filter(grepl(i,Company))
+intersect_sections<-st_union(int_touch_sf_f%>%filter(id=='Intersect'))%>%
+  st_as_sf()%>%
+  mutate(intersect_acres=round(as.numeric(st_area(x))/43560,0))
+
+adjacent_sections<-st_union(int_touch_sf_f%>%filter(id=='Adjacent'))%>%
+  st_as_sf()%>%
+  mutate(intersect_acres=round(as.numeric(st_area(x))/43560,0))
+
+
+
+ggplot()+
+  #basemap_gglayer( bounding_box, map_service = "carto", map_type = "light") +
+  scale_fill_identity()+
+  geom_sf(data=cop,fill='lightgrey',color=NA) + 
+  geom_sf(data=state_county_clip,fill=NA)+
+  geom_sf(data=potash,fill=NA,color='maroon')+
+  geom_sf(data=acreage_f,fill="yellow",color=NA)+
+  geom_sf(data=int_touch_sf_f,aes(fill=id),color=NA)+
+  scale_fill_manual(values = c("Adjacent" = "purple", "Intersect" = "#21fcfc"),
+                    labels = function(x) {
+                      ifelse(x == "Adjacent", 
+                             paste("Adjacent: ", comma(adjacent_sections$intersect_acres),' acres', sep = ""), 
+                             paste("Intersect: ", comma(intersect_sections$intersect_acres),' acres', sep = ""))
+                    })+
+  geom_sf(data=basin_lines,color='blue',linewidth=.5)+
+  theme_void()+
+  theme( plot.margin = margin(0.3, 0.3, 0.3, 0.3, "cm"), plot.background = element_rect(
+    colour = "black",
+    size = 1,
+    fill='white'
+  ),
+   legend.position = position_legend,
+   legend.justification = basin_legend,
+  legend.box.just = "right",
+  legend.margin = margin(6, 6, 6, 6),
+  legend.box.background = element_rect(color="black", size=1),
+  legend.box.margin = margin(6, 6, 6, 6),
+  legend.title=element_blank())+
+  coord_sf(
+    xlim = c(bounding_box[1], bounding_box[3]),
+    ylim = c(bounding_box[2], bounding_box[4]),
+    expand = T,
+    lims_method = 'box'
+  )+
+  guides(color = guide_legend(ncol = 1))+
+  geom_sf_text(data = state_county, aes(label = NAME), size = 3)
+
+
+ggsave(plot=last_plot(),paste(dir,'/',i,'_MAP.png',sep=""),
+       width=6.1*1.266087,height=6.1)
+
+##Prod chart
+
+
+prod_f<-production %>% filter(grepl(i,ENV_Opr))
+
+
+
+prod_ff<-prod_f%>%
+  group_by(API10)%>%
+  mutate(MinProd=min(PROD_DATE))%>%
+  mutate(year=as.numeric(format(MinProd, "%Y")))%>%
+  mutate(year=ifelse(year<2019,2018,year))%>%ungroup()%>%
+  group_by(year,PROD_DATE)%>%summarise(oil=sum(Oil_Rate_Merged_bbld,na.rm=T))
+  
+prod_ff$year<-as.factor(prod_ff$year)
+prod_ff$year<-fct_rev(prod_ff$year)
+
+prod_ff$PROD_DATE<-as.Date(prod_ff$PROD_DATE)
+
+prod_ff<-prod_ff%>%filter(PROD_DATE>"2017-12-31")
+
+ggplot(prod_ff) +
+  geom_area(aes(PROD_DATE, oil, fill = as.factor(year), color = as.factor(year)), size = 0.3) +  # Add color outline
+  scale_fill_manual(values = c("2018" = "lightgrey", "2019" = "#6F6F6E", "2020" = "#CBFF69", 
+                               "2021" = "#69FF87", "2022" = "#69DCFF", "2023" = "#69A7FF", 
+                               "2024" = "#FF69E4", "2025" = "purple"),
+                    labels = c("2018" = "Legacy", "2019" = "2019", "2020" = "2020", 
+                               "2021" = "2021", "2022" = "2022", "2023" = "2023", 
+                               "2024" = "2024", "2025" = "2025")) +
+  scale_color_manual(values = c("2018" = "grey", "2019" = "#565655", "2020" = "#A3CC59", 
+                                "2021" = "#50CC6E", "2022" = "#50B5CC", "2023" = "#5084CC", 
+                                "2024" = "#CC50B5", "2025" = "darkpurple"),
+                     labels = c("2018" = "Legacy", "2019" = "2019", "2020" = "2020", 
+                                "2021" = "2021", "2022" = "2022", "2023" = "2023", 
+                                "2024" = "2024", "2025" = "2025")) +  # Slightly darker outline colors
+  theme_minimal() +
+  theme(legend.position = 'bottom',
+        legend.key.size = unit(0.5, "cm"),
+        legend.text = element_text(hjust = 0.5, size = 14),
+        panel.background = element_rect(fill = "white", color = "white"),
+        plot.background = element_rect(fill = "white", color = "white"),
+        strip.background = element_rect(fill = "white", color = "white"),
+        axis.text.x = element_text(size = 14),  # Increase x-axis label size
+        axis.text.y = element_text(size = 14),
+        strip.text = element_text(size = 14),
+        axis.title.y = element_text(size = 12)) +
+  ylab("Horizontal Production") + 
+  xlab("") +
+  scale_y_continuous(labels = scales::comma) +
+  scale_x_date(date_labels = "%y") +  # Show only last two digits of the year
+  guides(fill = guide_legend(nrow = 1, label.position = "bottom", reverse = TRUE),
+         color = "none") +  # Hide separate color legend
+  labs(fill = NULL)
+
+ggsave(plot=last_plot(),filename = paste(dir,'/',i,'_production','.png',sep=""),width=12.96,height=6.1)
+
+
+spacing_f<-spacing%>%filter(grepl(i,ENV_Operator))
+
+
+
+spacing_f <- as_tibble(spacing_f) %>%
+  filter(Completion_Date>"2017-12-31")%>%
+  mutate(year_qtr = zoo::as.yearqtr(as.Date(Completion_Date))) %>%
+  group_by(LandingZoneBulk, year_qtr,color) %>%
+  summarise(meanDist = mean(Hypotenuse, na.rm = TRUE))%>%
+  mutate(year=year(year_qtr))
+
+color_mapping_spacing <- setNames(spacing_f$color, spacing_f$LandingZoneBulk)
+
+
+ggplot(spacing_f)+
+  geom_point(data=spacing,aes(year_qtr,Hypotenuse),color='grey',alpha=.2)+
+  geom_line(aes(year_qtr,meanDist,color=LandingZoneBulk),size=1.5)+
+  facet_wrap(~LandingZoneBulk,nrow=2)+
+  theme_minimal()+
+  theme(legend.position = "",
+        axis.text.x = element_text(size = 14),  # Increase x-axis label size
+        axis.text.y = element_text(size = 14),
+        strip.text = element_text(size = 14),
+        axis.title.y=element_text(size=12),
+        panel.background = element_rect(fill = "white", color = "white"),
+        plot.background = element_rect(fill = "white", color = "white"),
+        strip.background = element_rect(fill = "white", color = "white"),)+
+  scale_y_continuous( labels= scales::comma,limits = c(0,2000))+
+  scale_color_manual(values = color_mapping_spacing) +
+  scale_x_continuous(breaks = unique(year(spacing$Completion_Date)), labels = substr(unique(year(spacing$Completion_Date)), 3, 4))+
+  xlab("")
+
+
+ggsave(plot=last_plot(),filename = paste(dir,'/',i,'_spacing','.png',sep=""),width=12.96,height=6.1)
+
+comp_length<- pdp%>%filter(grepl(i,ENV_Opr),length>1000,COMPLET>"2017-12-31",)%>%
+  mutate(year_qtr = zoo::as.yearqtr(as.Date(COMPLET))) %>%
+  select(Basin,length,year_qtr)%>%group_by(Basin,year_qtr)%>%
+  summarise(meanLength=mean(length,na.rm=T))%>%
+  mutate(Source=i)
+  
+industry_length<- pdp%>%filter(length>1000,COMPLET>"2017-12-31",)%>%
+  mutate(year_qtr = zoo::as.yearqtr(as.Date(COMPLET))) %>%
+  select(Basin,length,year_qtr)%>%group_by(Basin,year_qtr)%>%
+  summarise(meanLength=mean(length,na.rm=T))%>%
+  mutate(Source='INDUSTRY')
+
+comp_length<-rbind(st_drop_geometry(industry_length),st_drop_geometry(comp_length))
+
+
+
+ggplot(comp_length%>%filter(Source=="INDUSTRY")) +
+  geom_line(aes(year_qtr, meanLength, color = Basin, group = Source), size = 1.5) +
+  geom_step(data = comp_length %>% filter(Source == i), 
+            aes(year_qtr, meanLength, color = Source, group = Source), 
+            size = 1.5) +
+  facet_wrap(~Basin, nrow = 1) +
+  scale_color_manual(values = c("DB" = "red", "MB" = "blue", setNames("#09d609", i)))+
+theme_minimal()+
+  theme(legend.position = "bottom",
+        legend.key.size = unit(0.5, "cm"),
+        legend.text = element_text(hjust = 0.5,size=14),
+        axis.text.x = element_text(size = 14),  # Increase x-axis label size
+        axis.text.y = element_text(size = 14),
+        strip.text = element_text(size = 14),
+        axis.title.y=element_text(size=12),
+        panel.background = element_rect(fill = "white", color = "white"),
+        plot.background = element_rect(fill = "white", color = "white"),
+        strip.background = element_rect(fill = "white", color = "white"),)+
+  scale_x_continuous(breaks = unique(year(comp_length$year_qtr)), labels = substr(unique(year(comp_length$year_qtr)), 3, 4))+
+  xlab("")+labs(color=NULL)+
+  scale_y_continuous(labels=comma)
+
+ggsave(plot=last_plot(),filename = paste(dir,'/',i,'_length','.png',sep=""),width=12.96,height=6.1)
+
+print(i)
+
+
+
+}
+
+
+
+
+company_vector<-st_drop_geometry(inventory)%>%group_by(Company)%>%summarise(MaxCount=max(row_number()))%>%
+  arrange(desc(MaxCount))
+
+
+
+lapply(company_vector[c(1:12,14:17,21),]$Company,output_plots_fctn)
+
+
+
+#####POWERPOINT
+
+base_path <- paste(getwd(),'Companies',sep='/')
+
+
+# create_ppt_from_folders <- function(base_path) {
+#   # List all directories (folders) in the base path
+#   folders <- list.dirs(base_path, full.names = TRUE, recursive = FALSE)
+#   #folder<-folders[2]
+#   # Loop through each folder
+#   for (folder in folders) {
+#     folder_name <- basename(folders[2])
+#     
+#     ppt <- read_pptx("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/Permian Inventory CoS Join/Charts/DO NO DELETE PPT TEMPLATE/template_update.pptx")
+#     
+#     # List all image files in the folder
+#     image_files <- list.files(paste(base_path,folder_name,sep="/"), pattern = "\\.(png|jpg|jpeg|bmp|gif)$", full.names = TRUE)
+#     #image_files<-rev(image_files)
+#     
+#     image_files_df<-data.frame(image_files)
+#     image_files_df<-image_files_df%>%mutate(file_name= sub("^.*/", "", image_files))
+#     image_files_df<-image_files_df%>%mutate(file_name= sub("\\..*$", "", file_name))
+#     image_files_df<-image_files_df%>%mutate(source_image=   sub("^.*_", "", file_name))
+#     image_files_df<-image_files_df%>%mutate(file_name= sub("_[^_]*$", "", file_name))
+#     image_files_df<-image_files_df%>%arrange(desc(source_image))%>%
+#         mutate(id=ifelse(source_image=='MAP',1,
+#                        ifelse(source_image=='trend',2,
+#                               ifelse(source_image=='box',3,
+#                                      ifelse(source_image=='production',4,
+#                                             ifelse(source_image=='cake',5,
+#                                                    ifelse(source_image=='spacing',6,7)))))))%>% arrange(id)%>%
+#       mutate(title_name=ifelse(source_image=='MAP','map',
+#                        ifelse(source_image=='trend','ACTIVITY TRENDS',
+#                               ifelse(source_image=='box','WELL PERFORMANCE',
+#                                      ifelse(source_image=='production','HZ. PRODUCTION',
+#                                             ifelse(source_image=='cake','CURRENT INVENTORY',
+#                                                    ifelse(source_image=='spacing','SPACING TRENDS','LATERAL LENGTH TRENDS')))))))
+#     
+#     
+#     
+#     image_files_df<-image_files_df%>%nest(.by=id)
+#     
+#     for (i in seq_along(image_files_df$id)) {
+#       data_f<-image_files_df%>%filter(id==i)%>%unnest()
+#       
+#       if(data_f$source_image=='MAP'){
+#         ppt <- add_slide(ppt, layout = "MapMonthlyReport", master = "Office Theme")
+#         
+#         # Add title name
+#         ppt <- ph_with(ppt, paste(unique(sub("\\.[^.]*$", "", data_f$file_name)),'ACREAGE OVERVIEW'), location = ph_location_label(ph_label = "Title 123"))
+#         
+#         # Add the image to the slide with full-size dimensions
+#         ppt <- ph_with(ppt, external_img(data_f$image_files), location = ph_location_label(ph_label = "Content Placeholder 123"))
+#         
+#           
+#       }else{
+#       # Add a slide with the "Title and Content" layout for each image
+#       ppt <- add_slide(ppt, layout = "summary", master = "Office Theme")
+#       
+#       # Add title name
+#       ppt <- ph_with(ppt, paste(unique(sub("\\.[^.]*$", "", data_f$file_name)),data_f$title_name), location = ph_location_label(ph_label = "Title 15"))
+#       
+#       # Add the image to the slide with full-size dimensions
+#       ppt <- ph_with(ppt, external_img(data_f$image_files), location = ph_location_label(ph_label = "Content Placeholder 2"))
+#       
+#       # # Add a slide with the "Title and Content" layout for each image
+#       # ppt <- add_slide(ppt, layout = "summary", master = "Office Theme")
+#       # 
+#       # # Add the image name as the title of the slide
+#       # ppt <- ph_with(ppt, unique(sub("\\.[^.]*$", "", data_f$file_name)), location = ph_location_label(ph_label = "Title 15"))
+#       # ppt <- ph_with(ppt, external_img(gbd$image_files), location = ph_location_label(ph_label = "Content Placeholder 2"))
+#       # 
+#       
+#       }
+#       
+#     }
+#     
+#     
+#     
+#     
+#     
+#     # Save the PowerPoint file with the folder name
+#     ppt_file <- file.path(base_path, paste0(folder_name, ".pptx"))
+#     print(paste("Saving PowerPoint:", ppt_file))
+#     
+#     # Save the PowerPoint presentation
+#     print(ppt, target = ppt_file)
+#     
+#     Sys.sleep(10)
+#   }
+# }
+# 
+# 
+# 
+# 
+# # Run the main function to create PowerPoint decks
+# create_ppt_from_folders(base_path)
+# 
+# 
+# 
+# 
+####asdf---
+
+base_path <- paste(getwd(), 'Companies', sep='/')
+
+create_single_ppt <- function(base_path, output_ppt) {
+  # Initialize a single PowerPoint presentation
+  ppt <- read_pptx("//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/TECHNICAL/Permian Inventory CoS Join/Charts/DO NO DELETE PPT TEMPLATE/template_update.pptx")
+  
+  # List all directories (folders) in the base path
+  folders <- list.dirs(base_path, full.names = TRUE, recursive = FALSE)
+  
+  for (folder in folders) {
+    folder_name <- basename(folder)
+    
+    # List all image files in the folder
+    image_files <- list.files(folder, pattern = "\\.(png|jpg|jpeg|bmp|gif)$", full.names = TRUE)
+    
+    image_files_df <- data.frame(image_files) %>%
+      mutate(file_name = sub("^.*/", "", image_files)) %>%
+      mutate(file_name = sub("\\..*$", "", file_name)) %>%
+      mutate(source_image = sub("^.*_", "", file_name)) %>%
+      mutate(file_name = sub("_[^_]*$", "", file_name)) %>%
+      arrange(desc(source_image)) %>%
+      mutate(id = case_when(
+        source_image == 'MAP' ~ 1,
+        source_image == 'trend' ~ 2,
+        source_image == 'box' ~ 3,
+        source_image == 'production' ~ 4,
+        source_image == 'cake' ~ 5,
+        source_image == 'spacing' ~ 6,
+        TRUE ~ 7
+      )) %>%
+      arrange(id) %>%
+      mutate(title_name = case_when(
+        source_image == 'MAP' ~ 'ACREAGE OVERVIEW',
+        source_image == 'trend' ~ 'ACTIVITY TRENDS',
+        source_image == 'box' ~ 'WELL PERFORMANCE',
+        source_image == 'production' ~ 'HZ. PRODUCTION',
+        source_image == 'cake' ~ 'CURRENT INVENTORY',
+        source_image == 'spacing' ~ 'SPACING TRENDS',
+        TRUE ~ 'LATERAL LENGTH TRENDS'
+      )) %>%
+      nest(.by = id)
+    
+    # Loop through each grouped image set and add slides
+    for (i in seq_along(image_files_df$id)) {
+      data_f <- image_files_df %>% filter(id == i) %>% unnest()
+      
+      if (data_f$source_image == 'MAP') {
+        ppt <- add_slide(ppt, layout = "MapMonthlyReport", master = "Office Theme")
+        ppt <- ph_with(ppt, paste(folder_name, unique(data_f$title_name)), location = ph_location_label(ph_label = "Title 123"))
+        ppt <- ph_with(ppt, external_img(data_f$image_files), location = ph_location_label(ph_label = "Content Placeholder 123"))
+      } else {
+        ppt <- add_slide(ppt, layout = "summary", master = "Office Theme")
+        ppt <- ph_with(ppt, paste(folder_name, unique(data_f$title_name)), location = ph_location_label(ph_label = "Title 15"))
+        ppt <- ph_with(ppt, external_img(data_f$image_files), location = ph_location_label(ph_label = "Content Placeholder 2"))
+      }
+    }
+  }
+  
+  # Save the final single PowerPoint file
+  print(paste("Saving Single PowerPoint:", output_ppt))
+  print(ppt, target = output_ppt)
+}
+
+# Run function to create a single PowerPoint
+output_ppt <- file.path(base_path, "Combined_Presentation.pptx")
+create_single_ppt(base_path, output_ppt)
+
