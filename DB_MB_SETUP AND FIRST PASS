@@ -1,0 +1,3403 @@
+DB SET UP
+sf_use_s2(FALSE)
+
+id <- openxlsx::read.xlsx("Delaware_Inventory/DELAWARE_INPUTS.xlsx",sheet=1)
+id<-id[,-2]
+operator_filter= c("DELAWARE_BASIN")
+
+
+#BASIN outline filter
+id<-id#%>%filter(!grepl("Basin",Type_Curve_Area))
+
+operator_filter = if (length(operator_filter) == 1) {
+  rep(operator_filter, each = length(operator_filter) * nrow(id) / 1)
+} else{
+  rep(operator_filter, each = length(operator_filter) * nrow(id) / 2)
+}
+
+id=cbind(id,operator_filter)
+id<-id%>%select(-wells_per_section)
+id<-id%>%relocate(operator_filter,.after = reservoir)
+id<- id%>%filter(grepl('DELAWARE_BASIN',operator_filter))
+id<-id%>%group_by(reservoir)%>%mutate(res_id=dense_rank(spacing_parameter))%>%ungroup()
+
+
+##Tier 1 and 3 Outline post process
+tier_outline<-read_sf('Delaware_Inventory/PermianBasin_Tiers_BD/Permian_TC_Areas.shp')
+tier_outline<-tier_outline%>%filter(Basin=='DB')
+
+####################\
+max_wps<-st_buffer(tier_outline,dist=50)%>%filter(zone=='WFMP A SH')%>%group_by(MAX_WPS)%>%
+  summarise(geometry=st_union(geometry))
+  
+bs3s<-st_difference(st_union(st_buffer(tier_outline,dist=50)%>%filter(zone=='BS3S')),st_union(st_buffer(max_wps,dist=9000)))
+bs3s<-st_intersection(tier_outline%>%filter(zone=='BS3S'),bs3s)
+
+
+wfmp_sd<-st_difference(st_union(st_buffer(tier_outline,dist=50)%>%filter(zone=='WFMP A SD')),st_union(st_buffer(max_wps,dist=50)))
+wfmp_sd<-st_intersection(tier_outline%>%filter(zone=='WFMP A SD'),wfmp_sd)
+
+
+tier_outline<-tier_outline%>%filter(!(zone %in% c("BS3S",'WFMP A SD')))
+
+tier_outline<-rbind(tier_outline,bs3s)
+tier_outline<-rbind(tier_outline,wfmp_sd)
+
+tier_outline<-tier_outline%>%mutate(WPS=ifelse(zone=='WFMP A SH',MAX_WPS,WPS))
+
+####################
+tier_outline_join<-left_join(tier_outline,id%>%select(Type_Curve_Area,spacing_parameter,reservoir),by=c("TC_Area"="Type_Curve_Area",'zone'='reservoir'))
+tier_outline_join<-tier_outline_join%>%rename(LZ=zone)
+tier_outline_join$spacing_parameter<-5280/tier_outline_join$WPS-20
+
+id<-id%>%left_join(st_drop_geometry(tier_outline_join)%>%select(LZ,TC_Area,spacing_parameter)%>%rename(sp2=spacing_parameter,Type_Curve_Area=TC_Area,reservoir=LZ))
+
+id$spacing_parameter<-id$sp2
+id<-id[,1:8]
+
+
+tier_outline<-st_buffer(tier_outline_join,dist=100)%>%group_by(LZ,spacing_parameter)%>%filter(!is.na(spacing_parameter))%>%
+  summarise(geometry=st_union(geometry))%>%
+  ungroup()
+
+tier_outline_join<-st_buffer(tier_outline_join,dist=0)%>%filter(!is.na(spacing_parameter))%>%
+  distinct(LZ,spacing_parameter,.keep_all=T)
+
+tier_outline<-left_join(tier_outline,st_drop_geometry(tier_outline_join))
+
+
+#id_filter<-id%>%group_by(reservoir,spacing_parameter)%>%distinct(.keep_all=T)%>%ungroup()
+#id<-id%>% filter(Type_Curve_Area %in% tier_outline$TC_Area)%>%select(-res_id)
+
+
+tier_outlineOriginal<-tier_outline
+
+
+tier_outlineOriginal<-tier_outlineOriginal%>%group_by(LZ,spacing_parameter,Basin)%>%
+  summarise(geometry=st_union(geometry))
+
+id_filter<-id%>%group_by(reservoir,spacing_parameter)%>%distinct(.keep_all=T)%>%ungroup()
+
+
+id<-id%>%distinct(reservoir,spacing_parameter,.keep_all=T)%>% filter(reservoir %in% tier_outlineOriginal$LZ & spacing_parameter %in% tier_outlineOriginal$spacing_parameter)
+id<-id%>%select(-res_id)
+
+id$operator_filter='DELAWARE_BASIN'
+
+print("done")
+
+id<-id%>%arrange(reservoir,spacing_parameter)%>%mutate(Type_Curve_Area=row_number())
+
+tier_outlineOriginal<-tier_outlineOriginal%>%ungroup()%>%arrange(LZ,spacing_parameter)%>%mutate(Type_Curve_Area=row_number())
+
+ggplot2::ggplot(tier_outlineOriginal)+geom_sf(aes(fill=as.character(spacing_parameter)))+facet_wrap(~LZ)+theme_minimal()+
+  theme(legend.position='')
+
+  
+
+
+
+DB ONLY
+##Run setup----
+
+source("Delaware_Inventory/07_Setup.R")
+
+
+id<- id%>%mutate(RowNumId=row_number())
+
+# ggplot(tier_outlineOriginal%>%filter(TC_Area==2))+geom_sf()
+# 
+# reservoir<- id[1,]$reservoir
+# pdp_zone<- id[1,]$pdp_zone
+# spacing_parameter<- id[1,]$spacing_parameter
+# operator_filter=id[1,]$operator_filter
+# Type_Curve_Area=id[1,]$Type_Curve_Area
+# Rank_Override=id[1,]$Rank_Override
+# pdp_alias_res=id[1,]$pdp_alias_res
+# RowNumId=id[1,]$RowNumId
+
+
+
+tier_outlineOriginal<- tier_outlineOriginal%>%rename(TC_Area=Type_Curve_Area)
+
+
+db_tiers<-tier_outlineOriginal
+
+
+
+
+
+op_func <-
+  function(reservoir,
+           operator_filter,
+           pdp_zone,
+           spacing_parameter,
+           Type_Curve_Area,
+           Rank_Override,
+           pdp_alias_res,
+           RowNumId) {
+    init_space <- if (grepl("WFMP A SH", reservoir, ignore.case = T)) {
+      offset = 330
+    } else if (grepl("WFMP A SD", reservoir, ignore.case = T)) {
+      offset = 530
+    } else if (grepl("BS3S|TBSG|FBSG|BS1", reservoir, ignore.case = T)) {
+      offset = 330
+    } else if (grepl("BS2|SBSG$", reservoir, ignore.case = T)) {
+      offset = 330
+    } else if (grepl("BS3C", reservoir, ignore.case = T)) {
+      offset = 750
+    } else if (grepl("LAVLN", reservoir, ignore.case = T)) {
+      offset = 330
+    } else if (grepl("MAVLN", reservoir, ignore.case = T)) {
+      offset = 530
+    } else if (grepl("UAVLN", reservoir, ignore.case = T)) {
+      offset = 330
+    } else if (grepl("WFMP B", reservoir, ignore.case = T)) {
+      offset = 330
+    } else if (grepl("WFMP A$", reservoir, ignore.case = T)) {
+      offset = 530
+    } else if (grepl("LSBY", reservoir, ignore.case = T)) {
+      offset = 330
+    } else if (grepl("JO MILL", reservoir, ignore.case = T)) {
+      offset = 530
+    } else if (grepl("MSBY", reservoir, ignore.case = T)) {
+      offset = 330
+    }else if (grepl("WFMP C", reservoir, ignore.case = T)) {
+      offset = 530
+    }else if (reservoir=="AVLN") {
+      offset = 330
+    }
+    
+    
+    
+    sfc_as_cols <- function(x, geometry, names = c("x", "y")) {
+      if (missing(geometry)) {
+        geometry <- sf::st_geometry(x)
+      } else {
+        geometry <- rlang::eval_tidy(enquo(geometry), x)
+      }
+      stopifnot(inherits(x, "sf") &&
+                  inherits(geometry, "sfc_POINT"))
+      ret <- sf::st_coordinates(geometry)
+      ret <- tibble::as_tibble(ret)
+      stopifnot(length(names) == ncol(ret))
+      x <- x[, !names(x) %in% names]
+      ret <- setNames(ret, names)
+      dplyr::bind_cols(x, ret)
+    }
+    
+    
+    # Read in Permian Tier Outlines and Acreage ----
+    tier_outline <- tier_outlineOriginal
+    
+    
+    #*****Removed with new code----
+    # else if (reservoir %in% c("TBSG", "WFMP A SD", "WFMP A SH")) {
+    #   tier_outline <-
+    #     tier_outline %>% filter(
+    #       grepl(Type_Curve_Area, TC_Area) |
+    #         grepl("WFMP A SH", TC_Area),
+    #       !grepl("Basin", TC_Area)
+    #     )
+    #   tier_outline <- st_buffer(tier_outline, dist = 0)
+    # } 
+    
+    
+    
+    
+    
+    tier_outline <- if (Type_Curve_Area %in% c("SBSG LWR SH_N Loving")) {
+      tier_outline <- tier_outline %>%filter(
+        TC_Area %in% c(
+          "SBSG LWR SH_N Loving",
+          "SBSG SW Red Hills",
+          "SBSG SL East",
+          "SBSG Lea Core Extension"
+        )
+      )
+      tier_outline <- st_buffer(tier_outline, dist = 0)
+    }else{
+      tier_outline <- tier_outline %>% filter(Type_Curve_Area == TC_Area)
+      tier_outline <- st_buffer(tier_outline, dist = 0)
+    }
+    
+    #st_crs(tier_outline) <- "+proj=longlat +datum=WGS84"
+    
+    tier_outline <- st_transform(tier_outline, "+init=epsg:2257")
+    
+    #Clean tier outline----
+    
+    tier_outline<-if (reservoir=='asdf') {
+      
+      tier_outline <- ms_dissolve(tier_outline, snap = T)
+      tier_outline <- ms_simplify(tier_outline, keep_shapes = T, keep = .2)
+    } else{
+      tier_outline
+    }
+    
+  
+
+    # * Read in generalized land grid ----
+    polygon <- read_sf("Op_Non_Unknown_Acreage/sections_grid/sections_rowId.shp")
+    polygon<-polygon[-35164,]
+    # polygon <-polygon%>%filter(row_id %in% c(
+    #   10598,
+    #   10691,
+    #   14712,
+    #   15492,
+    #   15502,
+    #   18357,
+    #   18358,
+    #   18462,
+    #   18466,
+    #   18467,
+    #   18468
+    #   ))
+    #Remove after PXD Test----
+    #polygon <-
+    #  read_sf("PostProcessLandGrid/PP_Delaware_BAsin_River_South_3Mile_gen_500.shp")
+    
+    polygon <- st_transform(polygon, "+init=epsg:2257")
+    
+    polygon <- polygon %>% mutate(SEC_ID = row_number())
+    
+    
+    #**Read in BD Operated Acreage----
+    ###Revert back for multiple operators
+    #acreage <- read_sf("Company_Acreage/env_permian.shp")
+    # acreage <- acreage %>%
+    #   filter(grepl(operator_filter, ENV_Op, ignore.case = T))
+    
+    ##Use for COP Operated shapefile
+    
+    #acreage<- read_sf("cop_acreage/Permian_Acreage_Status_02072022.shp")
+    
+    
+    # Use this for COP Acreage
+    #acreage<-st_buffer(acreage,dist=0)
+    #st_crs(acreage) <- "+init=epsg:32039"
+    #acreage <- st_transform(acreage, "+init=epsg:2257")
+    
+    
+    acreage<- read_sf("Op_Non_Unknown_Acreage/basin_outline/Delaware.shp")
+    #acreage<- read_sf('//conoco.net/HO_SHARED/MaxWell_L48_MC/MAX_General/PERMIAN/@BUSINESS_DEVELOPMENT/BD_ANALYST/SHAPE_DROP/20232615_NOVO_ACREAGE_RBC/NOVO_Op_RBC/NOVO.shp')
+    
+    
+    
+    # ggplot(acreage[1:25,])+geom_sf(aes(fill=as.character(row_id)))+
+    #   geom_sf(data=acreage%>%filter(row_id %in% c(17904,10804,15308,15309,15311,15312,19810,20080)),fill='black')+
+    #             theme(legend.position='bottom')
+    # 
+    
+    #e_w=acreage%>%filter(row_id %in% c(17904,10804,15308,15309,15311,15312,19810,20080))
+    
+    acreage<- st_union(acreage)
+    
+    # Use this for Acreage output 2257
+    st_crs(acreage) <- "+proj=longlat +datum=WGS84"
+    acreage <- st_transform(acreage, "+init=epsg:2257")
+    
+    acreage<-st_as_sf(acreage)
+    acreage<-st_buffer(acreage,dist=0)
+    
+    
+    polygon<-st_buffer(polygon,dist=0)
+    
+    acreage<-st_intersection(acreage,polygon)
+    
+    acreage <- acreage %>% st_buffer(0)
+    
+    acreage <- st_union(acreage)
+    acreage <- ms_dissolve(acreage, snap = T)
+    
+      
+    acreage <- ms_simplify(acreage, keep_shapes = T, keep = .9)
+    # Remove invalid geometries
+    polygon <- st_buffer(polygon, dist = 0)
+    
+        # *Filter to AOI from Tier OUtlines----
+    polygon<- polygon%>%mutate(LZ=reservoir,TC_Area=Type_Curve_Area)
+    
+    #ggplot(polygon)+geom_sf()+geom_sf(data=tier_outline,fill=NA,color='red')
+    
+    ##testing on acreage
+    #tier_outline<- acreage
+    
+    polygon_intersect = st_intersects(polygon, tier_outline)
+    sel_logical = lengths(polygon_intersect) > 0
+    polygon_intersect = polygon[sel_logical, ]
+    
+    polygon_intersect_tbl <-
+      st_intersection(polygon_intersect, tier_outline)
+    
+    spacing_override<-st_drop_geometry(polygon_intersect_tbl)%>%group_by(SEC_ID)%>%summarise(spacing_flag=max(row_number()))%>%
+      distinct(SEC_ID,.keep_all = T)
+    
+    polygon_intersect_tbl <-
+      polygon_intersect_tbl %>% mutate(WFMPA = ifelse(grepl("WFMP A", LZ), "A", "B"))
+    polygon_intersect_tbl <-
+      polygon_intersect_tbl %>% ungroup() %>% arrange(SEC_ID, WFMPA) %>% st_drop_geometry(.) %>%
+      distinct(SEC_ID, .keep_all = T)
+    
+    polygon_intersect<-polygon_intersect%>%left_join(polygon_intersect_tbl%>%select(SEC_ID,TC_Area))
+    
+    
+    polygon <- polygon_intersect
+    polygon_intersect <- polygon
+    
+      
+    polygon_intersect_co = st_intersects(polygon_intersect, acreage)
+    sel_logical = lengths(polygon_intersect_co) > 0
+    polygon_intersect = polygon_intersect[sel_logical, ]
+    
+    polygon <- polygon_intersect
+    polygon_intersect <- polygon
+    
+    
+    polygon_intersect_filter = st_intersects(polygon, tier_outline)
+    sel_logical = lengths(polygon_intersect_filter) > 0
+    polygon_intersect_filter = polygon[sel_logical, ]
+    
+    
+    polygon_intersect <-
+      inner_join(polygon_intersect,
+                 st_drop_geometry(polygon_intersect_filter) %>% select(SEC_ID))
+    
+    
+    polygon <- polygon_intersect
+    polygon_intersect <- polygon
+    
+    #polygon<-polygon%>%filter(grepl(paste(reservoir,'\\>',sep=""),TC_Area))
+    
+    #polygon<-polygon%>%filter(str_detect(TC_Area,reservoir))
+    
+    
+    polygon<-polygon%>%ungroup()%>%mutate(area=st_area(geometry))
+    
+    area_intersect=st_intersection(polygon,tier_outline)
+    
+    
+    area_intersect=area_intersect%>%mutate(area_intersect=st_area(geometry),PercArea=area_intersect/area)
+    area_intersect$PercArea<-as.numeric(area_intersect$PercArea)
+    
+    polygon<-left_join(polygon,st_drop_geometry(area_intersect)%>%select(SEC_ID,PercArea))%>%
+      filter(PercArea>.49)%>%select(-PercArea,-area)
+    
+    
+    #ggplot()+geom_sf(data=polygon)+geom_sf(data=tier_outline%>%filter(Type_Curve_Area==TC_Area),fill=NA)+theme_minimal()
+    
+    ###SKIP to see if data if filtered out----
+    # if(nrow(polygon)<1){
+    #   polygon="blank"
+    # } else{
+      
+      # * Convert and simplify----
+      
+      #polygon<-  rmapshaper::ms_simplify(polygon, keep = 0.5,keep_shapes = TRUE)
+      
+      st_crs(polygon) <- "+init=epsg:2257"
+      polygon <- st_transform(polygon, "+proj=longlat +datum=WGS84")
+      
+      
+      polygon <- as(polygon, "Spatial")
+      simplepolys <- polygon
+      simplepolysO <- simplepolys
+      
+      simplepolysO <- st_as_sf(simplepolysO)
+      
+      
+      # Create segments from land grid polygons----
+      simplepolys <-
+        simplepolysO%>% group_by(SEC_ID) %>% st_segments() %>% group_by(SEC_ID) %>%
+        mutate(ID = row_number())
+      
+      
+      # * Calculate length of segments----
+      
+      simplepolys <-
+        simplepolys %>% ungroup() %>% mutate(length = st_length(simplepolys))
+      
+      
+      coord_polys <-
+        simplepolys %>% group_by(SEC_ID) %>% st_coordinates(polygon_seg) %>% as_tibble() %>%
+        group_by(L1) %>% mutate(RowID = row_number()) %>%
+        pivot_wider(names_from = RowID, values_from = X:Y)
+      
+      
+      # Add relative bearing----
+      coord_polys <- coord_polys %>% mutate(Bearing_Rel =
+                                              ifelse(
+                                                bearingRhumb(c(X_1, Y_1), c(X_2, Y_2)) > 180,
+                                                bearingRhumb(c(X_1, Y_1), c(X_2, Y_2)) -
+                                                  180,
+                                                bearingRhumb(c(X_1, Y_1), c(X_2, Y_2))
+                                              ))
+      
+      
+      
+      # * Update CRS to feet----
+      st_crs(simplepolys) <- "+proj=longlat +datum=WGS84"
+      simplepolyswgs <- simplepolys
+      
+      simplepolys <- st_transform(simplepolys, "+init=epsg:2257")
+      
+      simplepolys <-
+        simplepolys %>% ungroup() %>% mutate(CoordID = row_number()) %>% left_join(coord_polys %>%
+                                                                                     select(L1, Bearing_Rel), by = c("CoordID" = "L1"))
+      simplepolys$length <- as.numeric(simplepolys$length * 3.28084)
+      
+      round.choose <- function(x, roundTo, dir = 1) {
+        if (dir == 1) {
+          ##ROUND UP
+          x + (roundTo - x %% roundTo)
+        } else {
+          if (dir == 0) {
+            ##ROUND DOWN
+            x - (x %% roundTo)
+          }
+        }
+      }
+      
+      simplepolys$Bearing_Rel <-
+        round.choose(simplepolys$Bearing_Rel, 10)
+      
+      ####Add lat_long 
+      first_point<- st_line_sample(st_transform(simplepolyswgs, "+init=epsg:2257"),sample=0)
+      first_point<-st_transform(first_point,"+proj=longlat +datum=WGS84")
+      first_point<-st_cast(first_point,"POINT")
+      first_point<-st_as_sf(first_point)
+      first_point<- sfc_as_cols(first_point)
+      first_point<-first_point[,-1]
+      colnames(first_point)[1]<-"x"
+      first_point<-first_point%>%
+        mutate(long_true= ifelse(x< -103.798188489405,'TRUE','FALSE'),
+               lat_true= ifelse(y> 32.3419654299699,'TRUE','FALSE'),
+               horizontal= ifelse(long_true==TRUE & lat_true==TRUE,TRUE,FALSE))
+      simplepolys<-left_join(simplepolys%>%mutate(row_id=row_number()),
+                             first_point%>%mutate(row_id=row_number())%>%select(row_id,horizontal))
+      
+
+      ##NM East West PDP Wells----
+      nm_pdp<-nm_pdpO%>%select(Unformatted_API_UWI,Latitude,Longitude,Latitude_BH,Longitude_BH)
+      
+      nm_pdp <- nm_pdp %>% rename(longitude = Longitude, latitude = Latitude,UWI=Unformatted_API_UWI)
+      
+      
+      nm_pdp <- nm_pdp %>% filter(!is.na(Longitude_BH))
+      
+      #wells<- wells%>% group_by(UWI)%>% mutate(MeanTVD= mean(TVD))
+      
+      projcrs <- "+init=epsg:32039"
+      
+      surface_wells <-
+        nm_pdp %>% select(UWI, longitude, latitude)
+      surface_wells <-
+        surface_wells %>% filter(!is.na(longitude), !is.na(latitude))
+      
+      surface_wells <- st_as_sf(surface_wells,
+                                coords = c("longitude", "latitude"),
+                                crs = "+proj=longlat +datum=WGS84")
+      
+      surface_wells <- st_transform(surface_wells, "+init=epsg:32039")
+      
+      surface_wells <- sfc_as_cols(surface_wells)
+      surface_wells <- st_drop_geometry(surface_wells)
+      colnames(surface_wells)[2] <- 'surf_longitude'
+      colnames(surface_wells)[3] <- 'surf_latitude'
+      
+      
+      bottom_wells <-
+      nm_pdp %>%select(UWI, Longitude_BH, Latitude_BH)
+      bottom_wells <-
+        bottom_wells %>% filter(!is.na(Longitude_BH), !is.na(Latitude_BH))
+      bottom_wells <- st_as_sf(bottom_wells,
+                               coords = c("Longitude_BH", "Latitude_BH"),
+                               crs = "+proj=longlat +datum=WGS84")
+      
+      bottom_wells <- st_transform(bottom_wells, "+init=epsg:32039")
+      
+      bottom_wells <- sfc_as_cols(bottom_wells)
+      bottom_wells <- st_drop_geometry(bottom_wells)
+      colnames(bottom_wells)[2] <- 'bh_longitude'
+      colnames(bottom_wells)[3] <- 'bh_latitude'
+      
+      
+      
+      nm_pdp <- left_join(nm_pdp, surface_wells)
+      nm_pdp <- left_join(nm_pdp, bottom_wells)
+      
+      nm_pdp<-
+        nm_pdp %>% mutate(WellborePosition = ifelse(
+          abs(surf_longitude - bh_longitude) > abs(surf_latitude - bh_latitude),
+          "East/West",
+          "North/South"
+        ))
+      
+      nm_pdp_sticks<-nm_pdp_sticksO%>%left_join(nm_pdp%>%select(UWI,WellborePosition),by=c("Unformatted_API_UWI"="UWI"))
+      nm_pdp_sticks<-nm_pdp_sticks%>%filter(WellborePosition=="East/West")
+      
+      st_crs(nm_pdp_sticks)<-"+proj=longlat +datum=WGS84"
+      nm_pdp_sticks<-st_transform(nm_pdp_sticks,"+init=epsg:32039")
+      nm_pdp_sticks<-nm_pdp_sticks%>%mutate(pdp_length=as.numeric(st_length(geometry)))%>%
+        filter(pdp_length>7200)
+      
+      nm_pdp_stick_int<-st_intersection(st_transform(nm_pdp_sticks,st_crs(simplepolysO)),simplepolysO)
+      
+      simplepolys<-simplepolys%>%mutate(East_West_pdp= ifelse(SEC_ID %in% c(unique(nm_pdp_stick_int$SEC_ID)),'yes','no'))
+      
+      #######Delaware Basin Only----
+      simplepolys_filtered <-
+        simplepolys %>% filter((Bearing_Rel == 90 & (horizontal==T | East_West_pdp=='yes')) |
+          !(Bearing_Rel > 79.9 &
+              Bearing_Rel < 87),
+          !(Bearing_Rel > 93 &
+              Bearing_Rel < 100),
+          Bearing_Rel != 110,
+          Bearing_Rel != 140,
+          Bearing_Rel != 150,
+          Bearing_Rel !=40,
+        )
+      
+      #write_sf(simplepolys_filtered,'simplepolys_filtered.shp')
+      
+      ###SF Midpoint function
+      st_line_midpoints <- function(sf_lines = NULL) {
+        
+        g <- st_geometry(sf_lines)
+        
+        g_mids <- lapply(g, function(x) {
+          
+          coords <- as.matrix(x)
+          
+          # this is just a copypaste of View(maptools:::getMidpoints):
+          get_mids <- function (coords) {
+            dist <- sqrt((diff(coords[, 1])^2 + (diff(coords[, 2]))^2))
+            dist_mid <- sum(dist)/2
+            dist_cum <- c(0, cumsum(dist))
+            end_index <- which(dist_cum > dist_mid)[1]
+            start_index <- end_index - 1
+            start <- coords[start_index, ]
+            end <- coords[end_index, ]
+            dist_remaining <- dist_mid - dist_cum[start_index]
+            mid <- start + (end - start) * (dist_remaining/dist[start_index])
+            return(mid)
+          }
+          
+          mids <- st_point(get_mids(coords))
+        })
+        
+        out <- st_sfc(g_mids, crs = st_crs(sf_lines))
+        out <- st_sf(out)
+      }
+      
+      simplepolys_filtered_mid_point <-
+        st_drop_geometry(sfc_as_cols(st_line_midpoints(simplepolys_filtered)))%>%
+        mutate(temp_id=row_number())
+      
+      simplepolys_filtered<-simplepolys_filtered%>%
+        mutate(temp_id=row_number())
+      
+      simplepolys_filtered<-left_join(simplepolys_filtered,simplepolys_filtered_mid_point%>%select(temp_id,x,y))
+        
+      #Keep East West Eddy and North/South Everywhere else----
+      simplepolys_filteredd<-
+        simplepolys_filtered%>%
+        filter(!(horizontal==FALSE & East_West_pdp=='no' & Bearing_Rel %in% c(90,100)))%>%
+        # filter(SEC_ID%in% c(212,701))%>%
+           group_by(SEC_ID)%>%
+           mutate(maxLength=max(length),)%>%
+         filter(!(maxLength>400 & length<400))%>%
+        mutate(bearing_60=any(Bearing_Rel==60),bearing_170=any(Bearing_Rel==170))%>%
+        #arrange(desc(length))%>%
+        mutate(horizontal=if(any(horizontal==TRUE)){TRUE} else {FALSE})%>%
+        filter(!(bearing_60==TRUE & Bearing_Rel!=60),
+          ((horizontal==TRUE | East_West_pdp=='yes') & Bearing_Rel %in% c(90,100))
+               |(horizontal==F & East_West_pdp=='no' & Bearing_Rel !=90 & Bearing_Rel !=100)|
+                 (horizontal==TRUE & length< 5500 & Bearing_Rel != 180 & Bearing_Rel != 10)|
+                 (horizontal==F & East_West_pdp=='no'))%>%
+        filter(length>10, (!(Bearing_Rel%in% c(90,100)) & horizontal ==F)|horizontal==TRUE| East_West_pdp=="yes", Bearing_Rel!=130, !(bearing_170==TRUE & Bearing_Rel==180))%>%ungroup()%>%group_by(row_id)%>%
+        mutate(max_y=if(((horizontal==T | East_West_pdp=='yes') & Bearing_Rel %in% c(90,100))==TRUE) {
+          "max_y"
+        } 
+        
+        else  {
+          "max_x"
+        })%>%
+        group_by(SEC_ID) %>%
+        mutate(max_y=if(any(max_y=='max_y')){"max_y"} else
+        {"max_x"})%>%filter(if(unique(max_y)=="max_y") {
+          y==max(y)
+        } 
+        
+        else  {
+          x==max(x)
+        })%>%
+        #filter(x == max(x)) %>%
+        #filter(length == max(length)) %>%
+        ungroup() %>%
+        mutate(CoordID = row_number())%>%
+        select(-x,-y,-max_y,-temp_id)
+      
+      
+      
+      coord_polys <-
+        simplepolys_filteredd %>% group_by(SEC_ID) %>% st_coordinates(polygon_seg) %>%
+        as_tibble() %>%
+        group_by(L1) %>% mutate(RowID = row_number()) %>%
+        pivot_wider(names_from = RowID, values_from = X:Y)
+      
+      simplepolys_filteredd <-
+        left_join(simplepolys_filteredd, coord_polys, by = c("CoordID" = "L1"))
+      
+      simplepolys_filteredd <- st_drop_geometry(simplepolys_filteredd)
+      
+      #Distance_Cols= read.xlsx("Delaware_Inventory/Copy of DELAWARE_INPUTS_original_RTA Edits for Pioneer and Devon Inventory.xlsx",sheet=2)
+      
+      simplepolys_filteredd <- simplepolys_filteredd%>%mutate(spacing_parameter=spacing_parameter)
+      
+      simplepolys_filteredd<-simplepolys_filteredd%>%distinct(SEC_ID,.keep_all=T)
+      
+      simplepolys_filteredd<-if(Type_Curve_Area=="SBSG LWR SH_N Loving"){
+        simplepolys_filteredd<-simplepolys_filteredd%>%left_join(spacing_override)
+        #simplepolys_filtered<-simplepolys_filtered%>%mutate(spacing_parameter=ifelse(spacing_flag>1,460,spacing_parameter))
+      }else{
+        simplepolys_filteredd
+      }
+      
+      
+      pivot_sf_X<-simplepolys_filteredd%>%select(SEC_ID,X_1,X_2)%>%pivot_longer(X_1:X_2)%>%mutate(row_id=row_number())
+      pivot_sf_Y<-simplepolys_filteredd%>%select(SEC_ID,Y_1,Y_2)%>%pivot_longer(Y_1:Y_2)%>%mutate(row_id=row_number())%>%rename(value2=value)
+      pivot_sf<-left_join(pivot_sf_X%>%select(-name),pivot_sf_Y%>%select(-name))%>%arrange(SEC_ID)
+      pivot_sf<-st_as_sf(pivot_sf,coords=c("value","value2"))
+      pivot_sf_line<-pivot_sf%>%group_by(SEC_ID)%>%summarise(geometry=st_union(geometry))%>%st_cast('LINESTRING')
+      
+      
+      st_crs(pivot_sf_line)="+init=epsg:32039"
+      
+      
+      
+      simplepolys_filtered_nest <-
+        simplepolys_filteredd %>% select(SEC_ID, X_1, X_2, Y_1, Y_2,spacing_parameter) %>% group_by(SEC_ID)
+      # nest()
+      simplepolys_filtered_nest <-
+        simplepolys_filtered_nest %>% mutate(spacing_parameter = ifelse(is.na(spacing_parameter), 1280, spacing_parameter))
+      
+      #simplepolys_filtered_nest<-simplepolys_filtered_nest[20:30,]
+      
+      # ggplot(st_as_sf(polygon)%>%filter((SEC_ID %in% simplepolys_filtered_nest$SEC_ID)))+geom_sf()+
+       #  geom_sf(data=polygon%>%filter((SEC_ID ==4103)),fill='red')
+      
+      # X_1=simplepolys_filtered_nest[1,]$X_1
+      # X_2=simplepolys_filtered_nest[1,]$X_2
+      # Y_1=simplepolys_filtered_nest[1,]$Y_1
+      # Y_2=simplepolys_filtered_nest[1,]$Y_2
+      # spacing_parameter=simplepolys_filtered_nest[1,]$spacing_parameter
+      
+      
+      
+      # For Loop----
+      parallel_spacing_fn <- function(X_1, X_2, Y_1, Y_2,spacing_parameter) {
+        x <-  c(X_1, X_2)
+        y <-  c(Y_1, Y_2)
+        
+        datalist = list()
+        datalist2 = list()
+        
+        
+        ##Distance Amount----
+        distance <-
+          c(
+            init_space,
+              spacing_parameter + init_space,
+              init_space + spacing_parameter * 2,
+              init_space + spacing_parameter * 3,
+             init_space + spacing_parameter * 4,
+            init_space + spacing_parameter * 5,
+            init_space + spacing_parameter * 6,
+            init_space + spacing_parameter * 7,
+            init_space + spacing_parameter * 8,
+            init_space + spacing_parameter * 9
+            # init_space + spacing_parameter * 10,
+            # init_space + spacing_parameter * 11,
+            # init_space + spacing_parameter * 12
+            #init_space + spacing_parameter * 13,
+            #init_space + spacing_parameter * 14,
+            #init_space + spacing_parameter * 15,
+            #init_space + spacing_parameter * 16
+          )
+        
+        
+        
+        for (d in distance) {
+          # Given a vector (defined by 2 points) and the distance,
+          # calculate a new vector that is distance away from the original
+          segment.shift <- function(x, y, d) {
+            # calculate vector
+            v <- c(x[2] - x[1], y[2] - y[1])
+            
+            # normalize vector
+            v <- v / sqrt((v[1] ** 2 + v[2] ** 2))
+            
+            # perpendicular unit vector
+            vnp <- c(-v[2], v[1])
+            
+            return(list(
+              x =  c(x[1] + d * vnp[1], x[2] + d * vnp[1]),
+              y =  c(y[1] + d * vnp[2], y[2] + d * vnp[2])
+            ))
+            
+          }
+          
+          
+          # allocate memory for the bike path
+          xn <- numeric((length(x) - 1) * 2)
+          yn <- numeric((length(y) - 1) * 2)
+          
+          for (i in 1:(length(x) - 1)) {
+            xs <- c(x[i], x[i + 1])
+            ys <- c(y[i], y[i + 1])
+            new.s <- segment.shift(xs, ys, -d)
+            xn[(i - 1) * 2 + 1] <-
+              new.s$x[1]
+            xn[(i - 1) * 2 + 2] <- new.s$x[2]
+            yn[(i - 1) * 2 + 1] <-
+              new.s$y[1]
+            yn[(i - 1) * 2 + 2] <- new.s$y[2]
+          }
+          
+          
+          
+          #dat1<-as_tibble()
+          dat1 <-
+            as.data.frame(xn) %>% mutate(id = row_number()) %>% mutate(Dist_Col = paste(d, "left", sep =
+                                                                                          "_"))
+          #datalist[[d]] <- dat1 # add it to your list
+          
+          #dat2<-as_tibble()
+          dat2 <-
+            as.data.frame(yn) %>% mutate(id = row_number()) %>% mutate(Dist_Col = paste(d, "left", sep =
+                                                                                          "_"))
+          #datalist2[[d]] <- dat2 # add it to your list
+          
+          
+          ###Now do right side
+          
+          # allocate memory for the path
+          # xn <- numeric((length(x) - 1) * 2)
+          # yn <- numeric((length(y) - 1) * 2)
+          # 
+          # for (i in 1:(length(x) - 1)) {
+          #   xs <- c(x[i], x[i + 1])
+          #   ys <- c(y[i], y[i + 1])
+          #   new.s <- segment.shift(xs, ys, -d)
+          #   xn[(i - 1) * 2 + 1] <-
+          #     new.s$x[1]
+          #   xn[(i - 1) * 2 + 2] <- new.s$x[2]
+          #   yn[(i - 1) * 2 + 1] <-
+          #     new.s$y[1]
+          #   yn[(i - 1) * 2 + 2] <- new.s$y[2]
+          # }
+          
+          
+          
+          # dat3 <-
+          #   as.data.frame(xn) %>% mutate(id = row_number()) %>% mutate(Dist_Col = paste(d, "right", sep =
+          #                                                                                 "_"))
+          
+          #datcomb <- full_join(dat1, dat3)
+          datcomb <- dat1
+          
+          datalist[[d]] <- datcomb # add it to your list
+          
+          
+          # dat4 <-
+          #   as.data.frame(yn) %>% mutate(id = row_number()) %>% mutate(Dist_Col = paste(d, "right", sep =
+          #                                                                                 "_"))
+          
+          # dat2comb <- full_join(dat2, dat4)
+          dat2comb <-dat2
+          datalist2[[d]] <- dat2comb # add it to your list
+          
+        }
+        big_data = do.call(rbind, datalist)
+        big_data2 = do.call(rbind, datalist2)
+        
+        
+        comb_data <- full_join(big_data, big_data2)
+        
+        sf <- st_as_sf(comb_data, coords = c("xn", "yn"))
+        
+        tst <- sf %>%
+          group_by(Dist_Col) %>%
+          summarise(do_union = FALSE) %>%
+          st_cast("LINESTRING")
+        
+        
+        st_crs(tst) <- "+init=epsg:2257"
+        tst <- st_transform(tst, "+init=epsg:2257")
+        
+        tst <- st_transform(tst, "+proj=longlat +datum=WGS84")
+
+        
+        
+        
+                
+      }
+      
+      ####End For Loop----
+      
+      
+      
+      ex = simplepolys_filtered_nest %>%
+        #unnest_wider(data) %>%
+        mutate(res = pmap(list(X_1, X_2, Y_1, Y_2,spacing_parameter), parallel_spacing_fn))
+      
+    
+      exf <- ex %>% unnest(res)
+      
+      
+      
+      # ggplot(st_as_sf(exf)) + geom_sf() +
+      # #geom_sf(data = tier_outline, fill =NA) +
+      #   geom_sf(data = simplepolys, color = 'red') #+
+      #   geom_sf(data = acreage)
+      
+      
+      #rm(list=setdiff(ls(), c("exf","simplepolys","polygon","simplepolyswgs","polygon_intersect","acreage")))
+      
+      
+      ##Reproject Polygon ----
+      ex_sf <- st_as_sf(exf)
+      
+      start_here<<-ex_sf
+      ex_sf<-start_here
+      
+      #ex_sf2257 <- st_transform(ex_sf, "+init=epsg:2257")
+      #ggplot(start_here)+geom_sf()
+      #write_sf(ex_sf2257,"ex_sf2257.shp")
+      
+      st_line_midpoints <- function(sf_lines = NULL) {
+        g <- st_geometry(sf_lines)
+        
+        g_mids <- lapply(g, function(x) {
+          coords <- as.matrix(x)
+          
+          # this is just a copypaste of View(maptools:::getMidpoints):
+          get_mids <- function (coords) {
+            dist <- sqrt((diff(coords[, 1]) ^ 2 + (diff(coords[, 2])) ^ 2))
+            dist_mid <- sum(dist) / 2
+            dist_cum <- c(0, cumsum(dist))
+            end_index <- which(dist_cum > dist_mid)[1]
+            start_index <- end_index - 1
+            start <- coords[start_index, ]
+            end <- coords[end_index, ]
+            dist_remaining <- dist_mid - dist_cum[start_index]
+            mid <-
+              start + (end - start) * (dist_remaining / dist[start_index])
+            return(mid)
+          }
+          
+          mids <- st_point(get_mids(coords))
+        })
+        
+        out <- st_sfc(g_mids, crs = st_crs(sf_lines))
+        out <- st_sf(out)
+      }
+      
+      
+      midpoint <- st_line_midpoints(ex_sf)
+      midpoint <- st_as_sf(midpoint)
+      midpoint <- st_coordinates(midpoint)
+      midpoint <- as_tibble(midpoint)
+      ex_sf_drop_geom <- st_drop_geometry(ex_sf)
+      ex_sf_drop_geom <- ex_sf_drop_geom %>% select(SEC_ID, Dist_Col)
+      
+      midpoint <- midpoint %>% mutate(RowId = row_number())
+      ex_sf_drop_geom <-
+        ex_sf_drop_geom %>% ungroup() %>% mutate(RowId = row_number())
+      
+      
+      midpoint <- left_join(midpoint, ex_sf_drop_geom)
+      midpoint <- midpoint %>% select(-RowId)
+      
+      midpoint <- st_as_sf(midpoint, coords = c("X", "Y"))
+      
+      st_crs(midpoint) <- "+proj=longlat +datum=WGS84"
+      midpoint <- st_transform(midpoint, "+init=epsg:2257")
+      
+      midpoint <-
+        st_join(midpoint, polygon_intersect, join = st_within)
+      
+      
+      midpoint <- midpoint %>% filter(SEC_ID.x == SEC_ID.y)
+      
+      
+      midpoint <-
+        st_drop_geometry(midpoint) %>% select(SEC_ID.x, Dist_Col) %>% rename(SEC_ID =
+                                                                               SEC_ID.x)
+      
+      ex_sf <- left_join(midpoint, ex_sf)
+      ex_sf <- st_as_sf(ex_sf)
+      
+      #ex_sf<-st_transform(ex_sf,"+init=epsg:2257")
+      
+      
+      #rm(list=setdiff(ls(), c("intersection_df","ex_sf","polygon")))
+      
+      #moved to bottom
+      ex_sf <- ex_sf %>% mutate(GroupLineID = row_number())
+      
+      acreage_clip <- ex_sf
+      
+      
+      
+      #**Reload Tier Outline----
+      
+      #tier_outline <- acreageasdf
+      tier_outline <- tier_outlineOriginal %>% filter(Type_Curve_Area == TC_Area)
+      tier_outline <- st_union(tier_outline)
+      
+      #st_crs(tier_outline) <- "+proj=longlat +datum=WGS84"
+      tier_outline <-st_transform(tier_outline, "+proj=longlat +datum=WGS84")
+      
+      tier_outline<-if (reservoir=='asdf') {
+        
+        tier_outline <- ms_dissolve(tier_outline, snap = T)
+        tier_outline <- ms_simplify(tier_outline, keep_shapes = T, keep = .2)
+      } else{
+        tier_outline
+      }
+      
+      tier_outline<-st_buffer(tier_outline,dist=0)
+      
+      intersection_df_clip <-
+        st_intersection(acreage_clip, tier_outline)
+      # ggplot(acreage_clip)+
+      #   geom_sf(data=tier_outline)+
+      #   geom_sf(color='red',size=5)
+      
+      ###Skip if no rows----
+      # if (nrow(intersection_df_clip)==0) {
+      #   intersection_df_clip="blank_int_df_clip"
+      # } else{
+        st_crs(intersection_df_clip) <- "+proj=longlat +datum=WGS84"
+        
+        intersection_df_clip <-
+          st_transform(intersection_df_clip, "+init=epsg:2257")
+        intersection_df_clip <-
+          intersection_df_clip %>% mutate(length = st_length(intersection_df_clip))
+        intersection_df_clip$length <-
+          as.numeric(intersection_df_clip$length)
+        intersection_df_clip <-
+          intersection_df_clip %>% filter(length > 1)
+        
+        
+        st_crs(intersection_df_clip) <- "+init=epsg:2257"
+        intersection_df_clip <-
+          st_transform(intersection_df_clip, "+proj=longlat +datum=WGS84")
+        
+        
+        acreage_clip <- st_cast(intersection_df_clip, 'LINESTRING')
+        
+        acreage_clip <-
+          acreage_clip %>% mutate(length = st_length(acreage_clip) * 3.28084)
+        acreage_clip$length <- as.numeric(acreage_clip$length)
+        acreage_clip <- acreage_clip %>% filter(length > 1)
+        acreage_clip$SEC_ID <- as.character(acreage_clip$SEC_ID)
+        
+        
+        #Filter out PDP----
+        # lines <- lines %>% mutate(length = st_length(lines))
+        # 
+        # lines$length <- as.numeric(lines$length)
+        # 
+        # lines <- lines %>% filter(length > 1000)
+        # 
+        # #lines<-lines%>%rename(Reservr=Reservoir)
+        # 
+        # lines<- lines%>%mutate(buffer_distance= ifelse(grepl(pdp_alias_res,Reservr),1000,500))
+        # print("made it!!!!")
+        # 
+        # 
+        # lines<- st_transform(lines,"+init=epsg:32039")
+        #lines <- st_buffer(lines,lines$buffer_distance, endCapStyle = 'FLAT')
+        #lines <- as_Spatial(lines)
+        
+        
+        # lines <-
+        #   rgeos::gBuffer(lines,
+        #                  width = -75,
+        #                  capStyle = 'FLAT',
+        #                  byid = TRUE)
+        # lines = st_as_sf(lines)
+        # 
+          
+        ##Filter Zone
+        # lines_zone <- lines %>% filter(grepl(pdp_zone, Reservr, ignore.case = T))
+        # 
+        # lines_zone <- st_transform(lines_zone, "+init=epsg:2257")
+        # 
+        # lines_zone <- st_union(lines_zone)
+        # 
+        # pdp_update_name<-str_replace_all(pdp_zone, "[|]", "_")
+        # 
+        # write_sf(lines_zone,paste("Delaware_Inventory/reservoir_output/", "pdp", "_", pdp_update_name, ".shp", sep = ""))
+        # 
+        
+        intersection_df_clipf <-
+          st_transform(intersection_df_clip, "+init=epsg:2257")
+        
+        
+        removed_pdp_buffer <- intersection_df_clip
+        
+        ### Combine mile laterals by grid to make 2 mile laterals----
+        
+        ##**Read in original land grid** ----
+        polygon <- read_sf("Op_Non_Unknown_Acreage/sections_grid/sections_rowId.shp")
+        
+        #st_crs(polygon) <- "+init=epsg:2257"
+        
+        #Remove after PXD Test----
+        #polygon <-
+        #  read_sf("PostProcessLandGrid/PP_Delaware_BAsin_River_South_3Mile.shp")
+        
+        
+        #polygon <- st_transform(polygon, "+init=epsg:2257")
+        
+        polygon <- polygon %>% mutate(SEC_ID = row_number())
+        
+        polygon <- st_transform(polygon, "+proj=longlat +datum=WGS84")
+        
+        polygon <- st_as_sf(polygon)
+        
+        polygon <- polygon %>% mutate(GridID = row_number())
+        
+        polygon <- polygon %>% select(GridID)
+        
+        removed_pdp_buffer <-
+          st_transform(removed_pdp_buffer, "+proj=longlat +datum=WGS84")
+        #removed_pdp_buffer<-st_transform(removed_pdp_buffer,"+init=epsg:2257")
+        
+        #polygon<-st_transform(polygon,"+proj=longlat +datum=WGS84")
+        polygon <- st_buffer(polygon, dist = 0)
+        
+        removed_pdp_buffer_filter <-
+          st_intersection(removed_pdp_buffer, polygon)
+        
+        
+        ###Start from here if having issues----
+        final_lines <-
+          removed_pdp_buffer_filter %>% select(GroupLineID, GridID, SEC_ID)
+        
+        st_crs(final_lines) <- "+proj=longlat +datum=WGS84"
+        final_lines <- st_transform(final_lines, "+init=epsg:2257")
+        
+        
+        options(scipen = 999)
+        final_lines <-
+          final_lines %>% ungroup() %>% mutate(length = st_length(final_lines))
+        final_lines$length <- as.numeric(final_lines$length)
+        
+        
+        final_lines <- final_lines %>% 
+          group_by(GroupLineID, SEC_ID) %>%
+          summarize(geometry = st_union(geometry))
+        
+        
+        
+        final_lines <-
+          final_lines %>% ungroup() %>% mutate(length = st_length(final_lines))
+        final_lines$length <- as.numeric(final_lines$length)
+        
+        final_lines <- final_lines %>% filter(length > 1)
+        
+        
+        
+        
+        ##Remove list objects----
+        
+        final_lines_rm_geo <-
+          final_lines# %>% filter(!grepl("list", geometry))
+        
+        
+        final_lines_rm_geo <- st_collection_extract(final_lines_rm_geo, "LINESTRING")
+        final_lines_rm_geo <- st_cast(final_lines_rm_geo, 'LINESTRING')
+        
+        
+        ###Add Drilling Unit ID to filter after line extension----
+        
+        
+        polygon <- st_transform(polygon, "+init=epsg:2257")
+        
+        ext_line_id <- final_lines_rm_geo
+        
+        st_crs(ext_line_id) <- st_crs(polygon)
+        
+        ext_line_id <- st_intersection(final_lines_rm_geo, polygon)
+        
+        ext_line_id <- st_collection_extract(ext_line_id, "LINESTRING")
+        ext_line_id <- st_cast(ext_line_id, 'LINESTRING')
+        
+        
+        #write_sf(ext_line_id,"ext_line_id.shp")
+        
+        ext_line_id <- ext_line_id %>% mutate(length_diff =  as.numeric(st_length(ext_line_id)))
+        
+        ext_line_id <- ext_line_id %>% group_by(GroupLineID) %>%
+          filter(length_diff == max(length_diff)) %>% ungroup()
+        
+        
+        
+        ext_line_id <-
+          st_drop_geometry(ext_line_id) %>% ungroup() %>% select(length, GridID, GroupLineID)
+        
+        ext_line_id <- ext_line_id %>% arrange(length)
+        
+        final_lines_rm_geo <- final_lines_rm_geo %>% arrange(length)
+        
+        final_lines_rm_geo <-
+          left_join(final_lines_rm_geo, ext_line_id[, 2:3])
+        
+        ##Find surface and bottom hole locations----
+        final_lines_rm_geo<<-final_lines_rm_geo
+        
+        final_lines_surf_pts = sfc_as_cols(st_cast(st_as_sf(
+          st_line_sample(final_lines_rm_geo, sample = c(0))
+        ), "POINT"))
+        final_lines_surf_pts <- final_lines_surf_pts[,-1]
+        final_lines_surf_pts <-
+          final_lines_surf_pts %>% rename(final_lines_surf_long = x...2,
+                                          final_lines_surf_lat = y) %>% mutate(Count = row_number())
+        
+        final_lines_bh_pts = sfc_as_cols(st_cast(st_as_sf(
+          st_line_sample(final_lines_rm_geo, sample = c(1))
+        ), "POINT"))
+        final_lines_bh_pts <- final_lines_bh_pts[,-1]
+        final_lines_bh_pts <-
+          final_lines_bh_pts %>% rename(final_lines_bh_long = x...2,
+                                        final_lines_bh_lat = y) %>% mutate(Count = row_number())
+        
+        final_lines_pts <-
+          full_join(final_lines_surf_pts, final_lines_bh_pts)
+        
+        final_lines_rm_geo <- final_lines_rm_geo %>%
+          mutate(Count = row_number()) %>%
+          left_join(final_lines_pts)
+        
+        final_lines_rm_geo <- st_drop_geometry(final_lines_rm_geo)
+        
+        long_final_lines <- final_lines_rm_geo %>%
+          select(Count, final_lines_surf_long, final_lines_bh_long) %>%
+          pivot_longer(2:3, values_to = "longitude") %>%
+          group_by(Count) %>% mutate(CountGroup = row_number())
+        
+        long_final_lines <-
+          long_final_lines %>% select(longitude, Count, CountGroup)
+        
+        long_final_lines <-
+          long_final_lines %>% pivot_wider(Count, names_from = CountGroup,
+                                           values_from = longitude) %>%
+          rename(surf_long = `1`, bh_long = `2`)
+        
+        lat_final_lines <- final_lines_rm_geo %>%
+          select(Count, final_lines_surf_lat, final_lines_bh_lat) %>%
+          pivot_longer(2:3, values_to = "latitude") %>% group_by(Count) %>%
+          mutate(CountGroup = row_number())
+        
+        lat_final_lines <-
+          lat_final_lines %>% select(Count, latitude, CountGroup)
+        
+        
+        lat_final_lines <-
+          lat_final_lines %>% pivot_wider(Count, names_from = CountGroup,
+                                          values_from = latitude) %>%
+          rename(surf_lat = `1`, bh_lat = `2`)
+        
+        
+        
+        ###Add unique count before join----
+        
+        wells_prep <- full_join(long_final_lines, lat_final_lines)
+        
+        wells_prep <-
+          left_join(wells_prep, final_lines_rm_geo %>% select(Count, length))
+        
+        ##Extend Line by 10k feet both directions----
+        
+        ext_line <-
+          wells_prep %>% mutate(
+            surf_lat_ext = surf_lat - (bh_lat - surf_lat) * 20000 / length,
+            surf_long_ext = surf_long - (bh_long -
+                                           surf_long) * 20000 / length,
+            bh_lat_ext = bh_lat + (bh_lat - surf_lat) *
+              20000 / length,
+            bh_long_ext = bh_long + (bh_long - surf_long) *
+              20000 / length
+          )
+        
+        ext_line <- ext_line %>%
+          select(Count, surf_lat_ext, surf_long_ext, bh_lat_ext, bh_long_ext)
+        
+        ext_line_lat <-
+          pivot_longer(ext_line[, c(1, 2, 4)], c(2, 3)) %>%
+          group_by(Count) %>%
+          mutate(CountGroup = row_number())
+        
+        ext_line_lat <-
+          ext_line_lat %>% select(value, Count, CountGroup) %>% rename(latitude =
+                                                                         value)
+        
+        
+        ext_line_long <-
+          pivot_longer(ext_line[, c(1, 3, 5)], c(2, 3)) %>% group_by(Count) %>%
+          mutate(CountGroup = row_number())
+        
+        ext_line_long <-
+          ext_line_long %>% select(value, Count, CountGroup) %>% rename(longitude =
+                                                                          value)
+        
+        combined <- full_join(ext_line_lat, ext_line_long)
+        
+        
+        combined <-
+          combined %>% filter(!is.na(longitude),!is.na(latitude))
+        
+        combined <- st_as_sf(combined,
+                             coords = c("longitude", "latitude"))
+        
+        
+        combined <- combined %>%
+          group_by(Count) %>%
+          summarise(do_union = FALSE) %>%
+          st_cast("LINESTRING")
+        
+        
+        st_crs(combined) <- "+init=epsg:2257"
+        combined <- st_transform(combined, "+init=epsg:2257")
+        
+        
+        ext_line <- combined[, 1]
+        
+        ext_line <- ext_line %>% mutate(length = st_length(ext_line))
+        ext_line$length <- as.numeric(ext_line$length)
+        
+        ext_line_id <- ext_line_id %>% mutate(Count = row_number()) %>%
+          rename(orig_length = length)
+        
+        ext_line <- left_join(ext_line, final_lines_rm_geo[, 4:5])
+        
+        
+        
+        ###Clip line to Drilling Unit
+        
+        ext_line = st_intersection(ext_line, polygon)
+        
+        
+        ext_line <- st_collection_extract(ext_line, "LINESTRING")
+        ext_line <- st_cast(ext_line, 'LINESTRING')
+        
+        
+        
+        ext_line_f = ext_line %>% filter(GridID == GridID.1)
+            
+        
+        #ext_line<-read_sf("ext_line3.shp")
+        
+        
+        #st_crs(ex_sf)<- "+proj=longlat +datum=WGS84"
+        #ex_sf<-st_transform(ex_sf,"+init=epsg:2257")
+        
+        
+        ####UPDATE DISTANCE SPACING PARAMETERS!!!!----
+        
+        acreage<-st_transform(acreage,"+init=epsg:2257")
+        
+        acreage <- st_buffer(acreage, dist = 0)
+        
+        acreage_dissolve <- st_union(acreage)
+        
+        ###** ext_line to multiline string----
+        ###***st_collection_extract***---
+        acreage_clip <- st_collection_extract(ext_line_f, "LINESTRING")
+        acreage_clip <- st_cast(acreage_clip, 'LINESTRING')
+        
+        #write_sf(acreage_clip,"acreage_clip.shp")
+        ####ASDF CHECK CRS----
+        
+        acreage_clip <-
+          st_intersection(acreage_clip, acreage_dissolve, tolerance = 0)
+        
+        
+        
+        
+        acreage_clip <-
+          st_collection_extract(acreage_clip, "LINESTRING")
+        
+        acreage_clip <-
+          acreage_clip %>% mutate(length = st_length(acreage_clip))
+        acreage_clip$length <- as.numeric(acreage_clip$length)
+        
+        #############################################################################################
+        #############################################################################################
+        ###Removed the pdp buffer
+        
+        # ###** Once again remove pdp using zone buffer----
+        # 
+        # #lines_zone<-st_transform(lines_zone,"+init=epsg:2257")
+        # lines_zone <- st_as_sf(lines_zone)
+        # 
+        # 
+        # ##Add back in to remove inventory from existing pdp----
+        # 
+        # # acreage_clip <- st_difference(acreage_clip, lines_zone)
+        # # acreage_clip <- st_collection_extract(acreage_clip, "LINESTRING")
+        # # acreage_clip <- st_cast(acreage_clip, 'LINESTRING')
+        # 
+        # acreage_clip<- acreage_clip%>%mutate(length=as.numeric(st_length(acreage_clip)))
+        # 
+        # removed_pdp_buffer_final<-acreage_clip%>%mutate(Count=row_number())
+        # 
+        # removed_pdp_buffer_final$reservoir <- reservoir
+        # removed_pdp_buffer_final$company <- operator_filter
+        # removed_pdp_buffer_final$pdp_basic <- pdp_zone
+        # 
+        # ##*Join Laterals----
+
+
+        mround <-
+          function(number, multiple)
+            multiple * round(number / multiple)
+
+        x <- acreage_clip
+
+
+        x<-distinct(x)
+
+        x<-x%>%mutate(Count=row_number())
+
+        x<-x%>%mutate(length=as.numeric(st_length(x)))
+
+        x<-x%>%filter(length>1)
+
+        ###Add Ifelse
+
+        # if(nrow(x)<1){
+        #   x="blank_pt"
+        # } else{
+
+           line_prep<-x
+
+          st_crs(line_prep)<- "+init=epsg:2257"
+          line_prep<-st_transform(line_prep,"+proj=longlat +datum=WGS84")
+
+          rnm<-function(x,y)round(x/y)*y
+          line_prep<-line_prep%>%mutate(bearing=round(line_bearing(.,bidirectional=T),0),bearing=ifelse(bearing==-1,0,bearing),bearing=rnm(bearing,5))
+
+          x<-left_join(x,st_drop_geometry(line_prep)%>%select(Count,bearing))%>%mutate(bearing=abs(bearing))
+
+          line_ex_buf <- st_buffer(x, dist = 165)
+
+          line_ex_buf<-line_ex_buf%>%group_by(bearing)%>%nest()
+
+
+          line_nest=line_ex_buf%>%mutate(union=map(.x=data,.f=~st_union(.)))
+
+          line_nest<-line_nest%>%unnest(union)
+
+          line_nest<-line_nest$union%>%as("Spatial")%>%st_as_sf()
+
+          line_nest<-line_nest%>%mutate(polyid=row_number())
+          #dissolved <- st_union(line_ex_buf) %>% as('Spatial') %>% st_as_sf()
+        
+          singlepart <- st_cast(line_nest, 'POLYGON') %>%
+            mutate(Buf_ID = as.factor(row_number()))
+
+          x<-st_intersection(x,singlepart)
+          
+          
+          
+          line_ex_f <- x %>% 
+            group_by(Buf_ID,polyid) %>%
+            summarise(do_union = T) %>%
+            st_cast("MULTILINESTRING")
+          
+         
+          line_ex_f <-
+            line_ex_f %>%ungroup()%>% mutate(comb_length = st_length(line_ex_f))
+          
+
+        #   line_ex_f$Lat_TC = mround(line_ex_f$comb_lenght / 5000, .25)
+        #   
+        #   combined_lines <- line_ex_f
+        #   
+        #   combined_lines <- st_as_sf(combined_lines)
+        #   
+        #   combined_lines <-
+        #     combined_lines %>% mutate(length = st_length(combined_lines))
+        #   
+        #   combined_lines$Lat_TC = mround(combined_lines$length / 5000, .25)
+        #   
+        #   CreateSegment <- function(coords, from, to) {
+        #     distance <- 0
+        #     coordsOut <- c()
+        #     biggerThanFrom <- F
+        #     for (i in 1:(nrow(coords) - 1)) {
+        #       d <- sqrt((coords[i, 1] - coords[i + 1, 1])^2 + (coords[i, 2] - coords[i + 
+        #                                                                                1, 2])^2)
+        #       distance <- distance + d
+        #       if (!biggerThanFrom && (distance > from)) {
+        #         w <- 1 - (distance - from)/d
+        #         x <- coords[i, 1] + w * (coords[i + 1, 1] - coords[i, 1])
+        #         y <- coords[i, 2] + w * (coords[i + 1, 2] - coords[i, 2])
+        #         coordsOut <- rbind(coordsOut, c(x, y))
+        #         biggerThanFrom <- T
+        #       }
+        #       if (biggerThanFrom) {
+        #         if (distance > to) {
+        #           w <- 1 - (distance - to)/d
+        #           x <- coords[i, 1] + w * (coords[i + 1, 1] - coords[i, 1])
+        #           y <- coords[i, 2] + w * (coords[i + 1, 2] - coords[i, 2])
+        #           coordsOut <- rbind(coordsOut, c(x, y))
+        #           break
+        #         }
+        #         coordsOut <- rbind(coordsOut, c(coords[i + 1, 1], coords[i + 1, 
+        #                                                                  2]))
+        #       }
+        #     }
+        #     return(coordsOut)
+        #   }
+        #   
+        #   
+        #   CreateSegments <- function(coords, length = 0, n.parts = 0) {
+        #     stopifnot((length > 0 || n.parts > 0))
+        #     # calculate total length line
+        #     total_length <- 0
+        #     for (i in 1:(nrow(coords) - 1)) {
+        #       d <- sqrt((coords[i, 1] - coords[i + 1, 1])^2 + (coords[i, 2] - coords[i + 
+        #                                                                                1, 2])^2)
+        #       total_length <- total_length + d
+        #     }
+        #     
+        #     # calculate stationing of segments
+        #     if (length > 0) {
+        #       stationing <- c(seq(from = 0, to = total_length, by = length), total_length)
+        #     } else {
+        #       stationing <- c(seq(from = 0, to = total_length, length.out = n.parts), 
+        #                       total_length)
+        #     }
+        #     
+        #     # calculate segments and store the in list
+        #     newlines <- list()
+        #     for (i in 1:(length(stationing) - 1)) {
+        #       newlines[[i]] <- CreateSegment(coords, stationing[i], stationing[i + 
+        #                                                                          1])
+        #     }
+        #     return(newlines)
+        #   }
+        #   
+        #   
+        #   MergeLast <- function(lst) {
+        #     l <- length(lst)
+        #     lst[[l - 1]] <- rbind(lst[[l - 1]], lst[[l]])
+        #     lst <- lst[1:(l - 1)]
+        #     return(lst)
+        #   }
+        #   
+        #   
+        #   SegmentSpatialLines <- function(sl, length = 0, n.parts = 0, merge.last = FALSE) {
+        #     stopifnot((length > 0 || n.parts > 0))
+        #     id <- 0
+        #     newlines <- list()
+        #     sl <- as(sl, "SpatialLines")
+        #     for (lines in sl@lines) {
+        #       for (line in lines@Lines) {
+        #         crds <- line@coords
+        #         # create segments
+        #         segments <- CreateSegments(coords = crds, length, n.parts)
+        #         if (merge.last && length(segments) > 1) {
+        #           # in case there is only one segment, merging would result into error
+        #           segments <- MergeLast(segments)
+        #         }
+        #         # transform segments to lineslist for SpatialLines object
+        #         for (segment in segments) {
+        #           newlines <- c(newlines, Lines(list(Line(unlist(segment))), ID = as.character(id)))
+        #           id <- id + 1
+        #         }
+        #       }
+        #     }
+        #     return(SpatialLines(newlines))
+        #   }
+        #   
+        #   
+        #   pt <- combined_lines %>% group_by(Buf_ID,polyid) %>% summarize(m = mean(row_number())) %>% st_cast("LINESTRING")
+        #   
+        #   tc_update_name<-Type_Curve_Area
+        #   
+        #   
+        #   tc_update_name<-str_replace_all(tc_update_name, "[+]", "")
+        #   pdp_update_name<-str_replace_all(pdp_zone, "[|]", "_")
+        #   
+        #   
+        #   
+        #   pt <- st_cast(pt, "POINT")%>%group_by(Buf_ID,polyid)%>%mutate(id=row_number())
+        #   
+        #   
+        #   # if(nrow(pt)<1){
+        #   #   polygon="blank_pt"
+        #   # } else{
+        #     pt<-sfc_as_cols(pt)  
+        #     
+        #     
+        #     pt<- pt%>%group_by(Buf_ID,polyid)%>%mutate(RowID=row_number())%>%filter(y==min(y)|y==max(y))
+        #     
+        #     pt <- pt %>% group_by(Buf_ID,polyid) %>% summarize(m = mean(row_number())) %>% st_cast("LINESTRING")
+        #     pt<-pt%>%ungroup()%>%mutate(length=st_length(pt))
+        #     
+        #     pt<-pt%>%mutate(length=as.numeric(length))%>%
+        #       mutate(Lat_TC = mround(length / 5300, .25))%>%select(-m)
+        #     
+            extend_line<<-line_ex_f
+            
+            #Write Extended Line----
+            
+            write_sf(
+              line_ex_f%>%select(geometry)%>%mutate(Company=unique(operator_filter),reservoir=reservoir,TC_Area=Type_Curve_Area),
+              paste(
+                "Delaware_Inventory/Basin_Inventory/",
+                unique(operator_filter),
+                "_",
+                reservoir,
+                "_",
+                RowNumId,
+                "TANK2.shp",
+                sep = ""
+              )
+            )
+            
+            
+            
+            # #combined_lines_split<-pt
+            # 
+            # 
+            # #split into 15000 length
+            # a<-pt%>%filter(Lat_TC%%3==0|(Lat_TC>4.9 & Lat_TC<6)|Lat_TC>7.9)
+            # 
+            # #split into 2 pieces Update this and next code to 3.25----
+            # b<-pt%>%filter((Lat_TC>3 & Lat_TC<4.9))
+            # 
+            # #keep as is
+            # c<-pt%>%filter(Lat_TC<3)
+            # 
+            # #split into 3 pieces
+            # d<-pt%>%filter(Lat_TC>6 & Lat_TC%%3!=0 & Lat_TC<8)
+            # 
+            # 
+            # #a
+            # combined_lines_split = if (nrow(a) == 0) {
+            #   a
+            # } else {
+            #   st_as_sf(SegmentSpatialLines(as_Spatial(a),
+            #                                length = 15900, merge.last = F))
+            # }
+            # 
+            # combined_lines_split = if (nrow(combined_lines_split) ==0) {
+            #   combined_lines_split
+            # } else {
+            #   combined_lines_split %>%
+            #     mutate(length = as.numeric(st_length(combined_lines_split))) %>%
+            #     mutate(id = paste("new", row_number()))
+            # }
+            # 
+            # #b
+            # 
+            # combined_lines_split_two_parts = if (nrow(b) == 0) {
+            #   b
+            # } else {
+            #   st_as_sf(SegmentSpatialLines(as_Spatial(b),
+            #                                n.parts = 3, merge.last = F))
+            # }
+            # 
+            # combined_lines_split_two_parts = if (nrow(combined_lines_split_two_parts) ==
+            #                                      0) {
+            #   combined_lines_split_two_parts
+            # } else {
+            #   combined_lines_split_two_parts %>%
+            #     mutate(length = as.numeric(st_length(combined_lines_split_two_parts))) %>%
+            #     mutate(id = paste("new2", row_number()))
+            # }
+            # ####
+            # combined_lines_split_three_parts = if (nrow(d) == 0) {
+            #   d
+            # } else {
+            #   st_as_sf(SegmentSpatialLines(as_Spatial(d),
+            #                                n.parts = 4, merge.last = F))
+            # }
+            # 
+            # combined_lines_split_three_parts = if (nrow(combined_lines_split_three_parts) ==
+            #                                        0) {
+            #   combined_lines_split_three_parts
+            # } else {
+            #   combined_lines_split_three_parts %>%
+            #     mutate(length = as.numeric(st_length(combined_lines_split_three_parts))) %>%
+            #     mutate(id = paste("new3", row_number()))
+            # }
+            # 
+            # 
+            # 
+            # 
+            # combined_lines_split <-if ((nrow(combined_lines_split)==0 | nrow(combined_lines_split)>0) & nrow(combined_lines_split_two_parts)==0) {
+            #   combined_lines_split
+            # }else if(nrow(combined_lines_split)==0 & nrow(combined_lines_split_two_parts)>0){
+            #   combined_lines_split_two_parts
+            # } else if (nrow(combined_lines_split)>0 & nrow(combined_lines_split_two_parts)>0){
+            #   st_as_sf(raster::bind(
+            #     as_Spatial(combined_lines_split),
+            #     as_Spatial(combined_lines_split_two_parts)
+            #   ))
+            # }
+            # 
+            # 
+            # combined_lines_split <-if ((nrow(combined_lines_split)==0 | nrow(combined_lines_split)>0) & nrow(combined_lines_split_three_parts)==0) {
+            #   combined_lines_split
+            # }else if(nrow(combined_lines_split)==0 & nrow(combined_lines_split_three_parts)>0){
+            #   combined_lines_split_three_parts
+            # } else if (nrow(combined_lines_split)>0 & nrow(combined_lines_split_three_parts)>0){
+            #   st_as_sf(raster::bind(
+            #     as_Spatial(combined_lines_split),
+            #     as_Spatial(combined_lines_split_three_parts)
+            #   ))
+            # }
+            # 
+            # 
+            # combined_lines_split <-if ((nrow(combined_lines_split)==0 | nrow(combined_lines_split)>0) & nrow(c)==0) {
+            #   combined_lines_split
+            # }else if(nrow(combined_lines_split)==0 & nrow(c)>0){
+            #   c
+            # } else if (nrow(combined_lines_split)>0 & nrow(c)>0){
+            #   st_as_sf(raster::bind(
+            #     as_Spatial(combined_lines_split),
+            #     as_Spatial(c)
+            #   ))
+            # }
+            # 
+            # 
+            # combined_lines_split<-combined_lines_split%>%mutate(length=as.numeric(st_length(combined_lines_split))) 
+            # combined_lines_split$Lat_TC = mround(combined_lines_split$length / 5000, .25)
+            # 
+            # combined_lines_split<-combined_lines_split%>%mutate(id=row_number())
+            # 
+            # tc_update_name=Type_Curve_Area
+            # 
+            # 
+            # tc_update_name<-str_replace_all(tc_update_name, "[+]", "")
+            # pdp_update_name<-str_replace_all(pdp_zone, "[|]", "_")
+            # 
+            # 
+            # 
+            # 
+            # combined_lines_split<-combined_lines_split%>%ungroup()%>%mutate(length=as.numeric(st_length(combined_lines_split)))
+            # combined_lines_split$Lat_TC = mround(combined_lines_split$length / 5000, .25)
+            # 
+            # combined_lines_split<<-combined_lines_split
+            # 
+            # 
+            # 
+            # write.xlsx(
+            #   st_drop_geometry(combined_lines_split)%>%mutate(Company=operator_filter,reservoir=reservoir),
+            #   paste(
+            #     "Delaware_Inventory/Basin_Inventory/",
+            #     operator_filter,
+            #     "_",
+            #     reservoir,
+            #     "_",
+            #     tc_update_name,
+            #     ".xlsx",
+            #     sep = ""
+            #   ),overwrite = T
+            # )
+            # 
+            # 
+            # write_sf(
+            #   combined_lines_split%>%mutate(Company=operator_filter,reservoir=reservoir,TC_Area=Type_Curve_Area),
+            #   paste(
+            #     "Delaware_Inventory/Basin_Inventory/",
+            #     operator_filter,
+            #     "_",
+            #     reservoir,
+            #     "_",
+            #     tc_update_name,
+            #     ".shp",
+            #     sep = ""
+            #   )
+            #   
+            # )
+            
+            
+}
+        
+  
+#END----
+
+op_func_purr<-purrr::possibly(op_func,otherwise=NA)
+id<-id%>%filter(spacing_parameter != Inf)
+
+#isd<-id%>%filter(reservoir %in% c('BS3S','WFMP A SD','WFMP A SH'))  
+pmap(id[11,],op_func)
+
+  #rm(list=ls())
+
+#op_function2 <- possibly(op_func, otherwise = NA)
+
+#pmap(id[6:9,],op_function2)
+
+
+
+
+MB SET UP
+sf_use_s2(FALSE)
+
+id <- openxlsx::read.xlsx("Midland_Inventory/MIDLAND_INPUTS.xlsx",sheet=1)
+id<-id[,-2]
+operator_filter= c("MIDLAND_BASIN")
+
+
+#BASIN outline filter
+id<-id#%>%filter(!grepl("Basin",Type_Curve_Area))
+
+operator_filter = if (length(operator_filter) == 1) {
+  rep(operator_filter, each = length(operator_filter) * nrow(id) / 1)
+} else{
+  rep(operator_filter, each = length(operator_filter) * nrow(id) / 2)
+}
+
+id=cbind(id,operator_filter)
+id<-id%>%select(-wells_per_section)
+id<-id%>%relocate(operator_filter,.after = reservoir)
+id<- id%>%filter(grepl('MIDLAND_BASIN',operator_filter))
+id<-id%>%group_by(reservoir)%>%mutate(res_id=dense_rank(spacing_parameter))%>%ungroup()
+
+
+##Tier 1 and 3 Outline post process
+tier_outline<-read_sf('Midland_Inventory/PermianBasin_Tiers_BD/Permian_TC_Areas.shp')
+tier_outline<-tier_outline%>%filter(Basin=='MB')
+
+
+tier_outline_join<-left_join(tier_outline,id%>%select(Type_Curve_Area,spacing_parameter,reservoir),by=c("TC_Area"="Type_Curve_Area",'zone'='reservoir'))
+tier_outline_join<-tier_outline_join%>%rename(LZ=zone)
+
+tier_outline<-tier_outline_join%>%group_by(LZ,spacing_parameter)%>%filter(!is.na(spacing_parameter))%>%
+  summarise(geometry=st_union(geometry))%>%
+  ungroup()
+
+tier_outline_join<-tier_outline_join%>%filter(!is.na(spacing_parameter))%>%
+  distinct(LZ,spacing_parameter,.keep_all=T)
+
+tier_outline<-left_join(tier_outline,st_drop_geometry(tier_outline_join))
+
+
+#id_filter<-id%>%group_by(reservoir,spacing_parameter)%>%distinct(.keep_all=T)%>%ungroup()
+#id<-id%>% filter(Type_Curve_Area %in% tier_outline$TC_Area)%>%select(-res_id)
+
+
+tier_outlineOriginal<-tier_outline
+
+#####Barnett Tier1 and Prospective
+
+# barnet1<-read_sf("Midland_Inventory/PermianBasin_Tiers_BD/BRNT Play Tier230913.shp")
+# barnet1<-st_zm(barnet1)%>%st_cast('POLYGON')%>%select(geometry)
+# 
+# barnet1<-barnet1%>%mutate(LZ='BRNT',spacing_parameter=1300,OBJECTID=1,TC_Area='BRNT_T1',STATE='TX',Shape_Leng=123,Shape_Area=456)%>%
+#   select(LZ, spacing_parameter,OBJECTID,TC_Area,STATE,Shape_Area,Shape_Leng)
+# 
+# barnet1<-st_transform(barnet1,st_crs(tier_outlineOriginal))
+# tier_outlineOriginal<-rbind(tier_outlineOriginal,barnet1)
+
+
+tier_outlineOriginal<-tier_outlineOriginal%>%group_by(LZ,spacing_parameter,Basin)%>%
+  summarise(geometry=st_union(geometry))
+
+barnetPros<-read_sf("Midland_Inventory/PermianBasin_Tiers_BD/BRNT Play Outline230913.shp")
+barnetPros<-st_zm(barnetPros)%>%st_cast('POLYGON')%>%select(geometry)
+
+barnetPros<-barnetPros%>%mutate(LZ='BRNT',spacing_parameter=1300,Basin="MB")%>%
+  select(LZ, spacing_parameter,Basin)
+
+barnetPros<-st_transform(barnetPros,st_crs(tier_outlineOriginal))
+
+#barnetPros<-st_difference(barnetPros,barnet1%>%select(geometry))
+tier_outlineOriginal<-rbind(tier_outlineOriginal,barnetPros)
+
+
+id_filter<-id%>%group_by(reservoir,spacing_parameter)%>%distinct(.keep_all=T)%>%ungroup()
+
+
+id<-id%>%distinct(reservoir,spacing_parameter,.keep_all=T)%>% filter(reservoir %in% tier_outlineOriginal$LZ & spacing_parameter %in% tier_outlineOriginal$spacing_parameter)
+id<-id%>%select(-res_id)
+
+id$operator_filter='MIDLAND_BASIN'
+
+print("done")
+
+id<-id%>%arrange(reservoir,spacing_parameter)%>%mutate(Type_Curve_Area=row_number())
+
+tier_outlineOriginal<-tier_outlineOriginal%>%ungroup()%>%arrange(LZ,spacing_parameter)%>%mutate(Type_Curve_Area=row_number())
+
+ggplot2::ggplot(tier_outlineOriginal)+geom_sf(aes(fill=as.character(spacing_parameter)))+facet_wrap(~LZ)+theme_minimal()+
+  theme(legend.position='bottom')
+
+
+
+
+
+  
+
+
+
+MB Only
+##Run setup----
+
+source("Midland_Inventory/06_Setup.R")
+
+
+
+#Set Distance, Operator and Zone Input----
+##### 8 WPS=640
+##### 7 WPS=734
+##### 6 WPS=860
+##### 5 WPS=1036 
+##### 4 WPS=1280
+
+
+
+
+#id <- id %>% select(-Filt)
+ # reservoir<- "LSBY"
+ # pdp_zone<- "LSBY|WFMP A|Dean|WFMP B"
+ # spacing_parameter<- 1300
+ # operator_filter='Midland_Basin'
+ # Type_Curve_Area='3'
+ # Rank_Override='NO'
+ # pdp_alias_res='LSBY'
+ # RowNumId= 3
+ 
+ 
+
+id<- id%>%mutate(RowNumId=row_number())
+
+tier_outlineOriginal<- tier_outlineOriginal%>%rename(TC_Area=Type_Curve_Area)
+
+
+op_func <-
+  function(reservoir,
+           operator_filter,
+           pdp_zone,
+           spacing_parameter,
+           Type_Curve_Area,
+           Rank_Override,
+           pdp_alias_res,
+           RowNumId) {
+    init_space <- if (grepl("WFMP A SH", reservoir, ignore.case = T)) {
+      offset = 330
+    } else if (grepl("WFMP A SD", reservoir, ignore.case = T)) {
+      offset = 530
+    } else if (grepl("TBSG", reservoir, ignore.case = T)) {
+      offset = 330
+    } else if (grepl("SBSG$", reservoir, ignore.case = T)) {
+      offset = 330
+    } else if (grepl("SBSG LWR SH", reservoir, ignore.case = T)) {
+      offset = 750
+    } else if (grepl("LAVLN", reservoir, ignore.case = T)) {
+      offset = 330
+    } else if (grepl("MAVLN", reservoir, ignore.case = T)) {
+      offset = 530
+    } else if (grepl("UAVLN", reservoir, ignore.case = T)) {
+      offset = 330
+    } else if (grepl("WFMP B", reservoir, ignore.case = T)) {
+      offset = 330
+    } else if (grepl("WFMP A$", reservoir, ignore.case = T)) {
+      offset = 530
+    } else if (grepl("LSBY", reservoir, ignore.case = T)) {
+      offset = 330
+    } else if (grepl("JO MILL", reservoir, ignore.case = T)) {
+      offset = 530
+    } else if (grepl("MSBY", reservoir, ignore.case = T)) {
+      offset = 330
+    }else if (grepl("WFMP C", reservoir, ignore.case = T)) {
+      offset = 530
+    }else if (grepl("BRNT", reservoir, ignore.case = T)) {
+      offset = 530
+    }else if (grepl("WFMP D", reservoir, ignore.case = T)) {
+      offset = 330
+    }else if (grepl("JMILL", reservoir, ignore.case = T)) {
+      offset = 530
+    }
+    
+    
+    
+    sfc_as_cols <- function(x, geometry, names = c("x", "y")) {
+      if (missing(geometry)) {
+        geometry <- sf::st_geometry(x)
+      } else {
+        geometry <- rlang::eval_tidy(enquo(geometry), x)
+      }
+      stopifnot(inherits(x, "sf") &&
+                  inherits(geometry, "sfc_POINT"))
+      ret <- sf::st_coordinates(geometry)
+      ret <- tibble::as_tibble(ret)
+      stopifnot(length(names) == ncol(ret))
+      x <- x[, !names(x) %in% names]
+      ret <- setNames(ret, names)
+      dplyr::bind_cols(x, ret)
+    }
+    
+    
+    
+    # Read in Permian Tier Outlines and Acreage ----
+    tier_outline <- tier_outlineOriginal
+    
+    
+    tier_outline <- if (Type_Curve_Area %in% c("SBSG LWR SH_N Loving")) {
+      tier_outline <- tier_outline %>%filter(
+        TC_Area %in% c(
+          "SBSG LWR SH_N Loving",
+          "SBSG SW Red Hills",
+          "SBSG SL East",
+          "SBSG Lea Core Extension"
+        )
+      )
+      tier_outline <- st_buffer(tier_outline, dist = 0)
+    } else if (reservoir %in% c("TBSG", "WFMP A SD", "WFMP A SH")) {
+      tier_outline <-
+        tier_outline %>% filter(
+          grepl(Type_Curve_Area, TC_Area) |
+            grepl("WFMP A SH", TC_Area),
+          !grepl("Basin", TC_Area)
+        )
+      tier_outline <- st_buffer(tier_outline, dist = 0)
+    } else{
+      tier_outline <- tier_outline %>% filter(Type_Curve_Area == TC_Area)
+      tier_outline <- st_buffer(tier_outline, dist = 0)
+    }
+    
+    #st_crs(tier_outline) <- "+proj=longlat +datum=WGS84"
+    
+    tier_outline <- st_transform(tier_outline, "+init=epsg:2257")
+    
+    #Clean tier outline----
+    
+    tier_outline<-if (reservoir=='asdf') {
+      
+      tier_outline <- ms_dissolve(tier_outline, snap = T)
+      tier_outline <- ms_simplify(tier_outline, keep_shapes = T, keep = .2)
+    } else{
+      tier_outline
+    }
+    
+    
+    # * Read in generalized land grid ----
+    polygon <- read_sf("Op_Non_Unknown_Acreage/sections_grid/sections_rowId.shp")
+    polygon<-polygon[-35164,]
+    #polygon<- polygon%>%filter(row_id %in% c())
+    
+    
+  
+    
+    #Remove after PXD Test----
+    #polygon <-
+    #  read_sf("PostProcessLandGrid/PP_Delaware_BAsin_River_South_3Mile_gen_500.shp")
+    
+    polygon <- st_transform(polygon, "+init=epsg:2257")
+    
+    polygon <- polygon %>% mutate(SEC_ID = row_number())
+    
+    
+    #**Read in BD Operated Acreage----
+    ###Revert back for multiple operators
+    #acreage <- read_sf("Company_Acreage/env_permian.shp")
+    # acreage <- acreage %>%
+    #   filter(grepl(operator_filter, ENV_Op, ignore.case = T))
+    
+    #Use for COP Operated shapefile
+    #Use for COP Operated shapefile
+    
+    if(reservoir=='BRNT'){
+    acreage<- read_sf("Op_Non_Unknown_Acreage/basin_outline/Midland.shp")  
+    cbp<-read_sf("Op_Non_Unknown_Acreage/basin_outline/cbp.shp")
+    cbp<-st_cast(cbp,'POLYGON')
+    acreage<-rbind(acreage%>%select(geometry),st_transform(cbp%>%select(geometry),st_crs(acreage)))%>%mutate(id="a")
+    st_crs(acreage) <- "+proj=longlat +datum=WGS84"
+    acreage <- st_transform(acreage, "+init=epsg:2257")
+    acreage<-st_buffer(acreage,dist=2000)
+    acreage<-acreage%>%group_by(id)%>%summarise(geometry=st_union(geometry))
+    acreage <- st_transform(acreage, "+proj=longlat +datum=WGS84")
+    }else{
+      acreage<- read_sf("Op_Non_Unknown_Acreage/basin_outline/Midland.shp")  
+    }
+    
+    acreage<- st_union(acreage)
+    
+    # Use this for Acreage output 2257
+    st_crs(acreage) <- "+proj=longlat +datum=WGS84"
+    acreage <- st_transform(acreage, "+init=epsg:2257")
+    
+    #acreage<- read_sf("Acreage/output/PIONEER NATURAL RESOURCES.shp")
+    
+    acreage<- st_union(acreage)
+    
+    
+    # Use this for Acreage output 2257
+    #st_crs(acreage) <- "+init=epsg:32039"
+    #acreage <- st_transform(acreage, "+init=epsg:2257")
+    
+    acreage<-st_as_sf(acreage)
+    acreage<-st_buffer(acreage,dist=0)
+    
+      
+    polygon<-st_buffer(polygon,dist=0)
+    
+    acreage<-st_intersection(acreage,polygon)
+    
+    acreage <- acreage %>% st_buffer(0)
+    
+    acreage <- st_union(acreage)
+    acreage <- ms_dissolve(acreage, snap = T)
+    
+      
+    acreage <- ms_simplify(acreage, keep_shapes = T, keep = .9)
+    # Remove invalid geometries
+    polygon <- st_buffer(polygon, dist = 0)
+    
+        # *Filter to AOI from Tier OUtlines----
+    polygon<- polygon%>%mutate(LZ=reservoir,TC_Area=Type_Curve_Area)
+    
+    #ggplot(polygon)+geom_sf()+geom_sf(data=tier_outline,fill=NA,color='red')
+    
+    polygon_intersect = st_intersects(polygon, tier_outline)
+    sel_logical = lengths(polygon_intersect) > 0
+    polygon_intersect = polygon[sel_logical, ]
+    
+    polygon_intersect_tbl <-
+      st_intersection(polygon_intersect, tier_outline)
+    
+    spacing_override<-st_drop_geometry(polygon_intersect_tbl)%>%group_by(SEC_ID)%>%summarise(spacing_flag=max(row_number()))%>%
+      distinct(SEC_ID,.keep_all = T)
+    
+    polygon_intersect_tbl <-
+      polygon_intersect_tbl %>% mutate(WFMPA = ifelse(grepl("WFMP A", LZ), "A", "B"))
+    polygon_intersect_tbl <-
+      polygon_intersect_tbl %>% ungroup() %>% arrange(SEC_ID, WFMPA) %>% st_drop_geometry(.) %>%
+      distinct(SEC_ID, .keep_all = T)
+    
+    polygon_intersect<-polygon_intersect%>%left_join(polygon_intersect_tbl%>%select(SEC_ID,TC_Area))
+    
+    
+    polygon <- polygon_intersect
+    polygon_intersect <- polygon
+    
+  
+    
+    polygon_intersect_co = st_intersects(polygon_intersect, acreage)
+    sel_logical = lengths(polygon_intersect_co) > 0
+    polygon_intersect = polygon_intersect[sel_logical, ]
+    
+    polygon <- polygon_intersect
+    polygon_intersect <- polygon
+    
+    
+    polygon_intersect_filter = st_intersects(polygon, tier_outline)
+    sel_logical = lengths(polygon_intersect_filter) > 0
+    polygon_intersect_filter = polygon[sel_logical, ]
+    
+    
+    polygon_intersect <-
+      inner_join(polygon_intersect,
+                 st_drop_geometry(polygon_intersect_filter) %>% select(SEC_ID))
+    
+    
+    polygon <- polygon_intersect
+    polygon_intersect <- polygon
+    
+    #polygon<-polygon%>%filter(grepl(paste(reservoir,'\\>',sep=""),TC_Area))
+    
+    #polygon<-polygon%>%filter(str_detect(TC_Area,reservoir))
+    
+    polygon<-polygon%>%ungroup()%>%mutate(area=st_area(geometry))
+    
+    area_intersect=st_intersection(polygon,tier_outline)
+    
+    area_intersect=area_intersect%>%mutate(area_intersect=st_area(geometry),PercArea=area_intersect/area)
+    area_intersect$PercArea<-as.numeric(area_intersect$PercArea)
+    
+    polygon<-left_join(polygon,st_drop_geometry(area_intersect)%>%select(SEC_ID,PercArea))%>%
+      filter(PercArea>.499999)%>%select(-PercArea,-area)
+    
+    
+    #ggplot()+geom_sf(data=polygon)+geom_sf(data=tier_outline%>%filter(Type_Curve_Area==TC_Area),fill=NA)+theme_minimal()
+    
+    ###SKIP to see if data if filtered out----
+    # if(nrow(polygon)<1){
+    #   polygon="blank"
+    # } else{
+      
+      # * Convert and simplify----
+      
+      #polygon<-  rmapshaper::ms_simplify(polygon, keep = 0.5,keep_shapes = TRUE)
+      
+      st_crs(polygon) <- "+init=epsg:2257"
+      polygon <- st_transform(polygon, "+proj=longlat +datum=WGS84")
+      
+      
+      polygon <- as(polygon, "Spatial")
+      simplepolys <- polygon
+      simplepolysO <- simplepolys
+      
+      simplepolysO <- st_as_sf(simplepolysO)
+      
+      
+      # Create segments from land grid polygons----
+      simplepolys <-
+        simplepolysO%>% group_by(SEC_ID) %>% st_segments() %>% group_by(SEC_ID) %>%
+        mutate(ID = row_number())
+      
+      
+      # * Calculate length of segments----
+      
+      simplepolys <-
+        simplepolys %>% ungroup() %>% mutate(length = st_length(simplepolys))
+      
+      
+      coord_polys <-
+        simplepolys %>% group_by(SEC_ID) %>% st_coordinates(polygon_seg) %>% as_tibble() %>%
+        group_by(L1) %>% mutate(RowID = row_number()) %>%
+        pivot_wider(names_from = RowID, values_from = X:Y)
+      
+      
+      # Add relative bearing----
+      coord_polys <- coord_polys %>% mutate(Bearing_Rel =
+                                              ifelse(
+                                                bearingRhumb(c(X_1, Y_1), c(X_2, Y_2)) > 180,
+                                                bearingRhumb(c(X_1, Y_1), c(X_2, Y_2)) -
+                                                  180,
+                                                bearingRhumb(c(X_1, Y_1), c(X_2, Y_2))
+                                              ))
+      
+      
+      
+      # * Update CRS to feet----
+      st_crs(simplepolys) <- "+proj=longlat +datum=WGS84"
+      simplepolyswgs <- simplepolys
+      
+      simplepolys <- st_transform(simplepolys, "+init=epsg:2257")
+      
+      simplepolys <-
+        simplepolys %>% ungroup() %>% mutate(CoordID = row_number()) %>% left_join(coord_polys %>%
+                                                                                     select(L1, Bearing_Rel), by = c("CoordID" = "L1"))
+      simplepolys$length <- as.numeric(simplepolys$length * 3.28084)
+      
+      round.choose <- function(x, roundTo, dir = 1) {
+        if (dir == 1) {
+          ##ROUND UP
+          x + (roundTo - x %% roundTo)
+        } else {
+          if (dir == 0) {
+            ##ROUND DOWN
+            x - (x %% roundTo)
+          }
+        }
+      }
+      
+      simplepolys$Bearing_Rel <-
+        round.choose(simplepolys$Bearing_Rel, 10)
+      
+      #######Midland Basin Only----
+      simplepolys_filtered <-
+        simplepolys %>% filter(
+          !(Bearing_Rel > 79.9 &
+              Bearing_Rel < 100.1),
+          Bearing_Rel != 110,
+          Bearing_Rel != 140,
+          Bearing_Rel != 150,
+          Bearing_Rel != 60,
+          Bearing_Rel != 70,
+          !(Bearing_Rel > -1 & Bearing_Rel < 9)
+        )
+      
+      simplepolys_filtered<-simplepolys_filtered %>% group_by(row_id)%>%
+        mutate(id170=ifelse(any(Bearing_Rel==170),TRUE,FALSE))%>%
+        filter((Bearing_Rel==170 & id170==T)| id170==F)
+        
+      
+      
+      ###SF Midpoint function
+      st_line_midpoints <- function(sf_lines = NULL) {
+        
+        g <- st_geometry(sf_lines)
+        
+        g_mids <- lapply(g, function(x) {
+          
+          coords <- as.matrix(x)
+          
+          # this is just a copypaste of View(maptools:::getMidpoints):
+          get_mids <- function (coords) {
+            dist <- sqrt((diff(coords[, 1])^2 + (diff(coords[, 2]))^2))
+            dist_mid <- sum(dist)/2
+            dist_cum <- c(0, cumsum(dist))
+            end_index <- which(dist_cum > dist_mid)[1]
+            start_index <- end_index - 1
+            start <- coords[start_index, ]
+            end <- coords[end_index, ]
+            dist_remaining <- dist_mid - dist_cum[start_index]
+            mid <- start + (end - start) * (dist_remaining/dist[start_index])
+            return(mid)
+          }
+          
+          mids <- st_point(get_mids(coords))
+        })
+        
+        out <- st_sfc(g_mids, crs = st_crs(sf_lines))
+        out <- st_sf(out)
+      }
+      
+      simplepolys_filtered_mid_point <-
+        st_drop_geometry(sfc_as_cols(st_line_midpoints(simplepolys_filtered)))%>%
+        mutate(temp_id=row_number())
+      
+      simplepolys_filtered<-simplepolys_filtered%>%
+        mutate(temp_id=row_number())
+      
+      simplepolys_filtered<-left_join(simplepolys_filtered,simplepolys_filtered_mid_point%>%select(temp_id,x))
+      
+      simplepolys_filtered_surf_pts = sfc_as_cols(st_cast(st_as_sf(
+         st_line_sample(simplepolys_filtered, sample = c(0))
+       ), "POINT"))%>%rename(surface_long=`x...2`,surface_lat=y)
+      
+      simplepolys_filtered_surf_pts<-simplepolys_filtered_surf_pts[,-1]
+      
+      
+      simplepolys_filtered<-left_join(simplepolys_filtered%>%ungroup()%>%mutate(idx=row_number()),simplepolys_filtered_surf_pts%>%mutate(idx=row_number()))  
+        
+      
+      #Remove East West Shell Only----
+      simplepolys_filtered<-
+        simplepolys_filtered %>%
+        filter(length>200, !(Bearing_Rel== 100 & length<5500))%>%
+        group_by(SEC_ID) %>% 
+        filter(if (max(length)>7500) {
+          length==max(length)
+        } else  {
+          surface_long==max(surface_long)
+        })%>%
+        #filter(x == max(x)) %>%
+        #filter(length == max(length)) %>%
+        ungroup() %>%
+        mutate(CoordID = row_number())%>%
+        select(-x,-temp_id,-idx,-surface_long,-surface_lat,-id170)
+      
+      coord_polys <-
+        simplepolys_filtered %>% group_by(SEC_ID) %>% st_coordinates(polygon_seg) %>%
+        as_tibble() %>%
+        group_by(L1) %>% mutate(RowID = row_number()) %>%
+        pivot_wider(names_from = RowID, values_from = X:Y)
+      
+      simplepolys_filtered <-
+        left_join(simplepolys_filtered, coord_polys, by = c("CoordID" = "L1"))
+      
+      simplepolys_filtered <- st_drop_geometry(simplepolys_filtered)
+      
+      #Distance_Cols= read.xlsx("Midland_Inventory/MIDLAND_INPUTS.xlsx",sheet=2)
+      
+      simplepolys_filtered <- simplepolys_filtered%>%mutate(spacing_parameter=spacing_parameter)
+        
+      simplepolys_filtered<-simplepolys_filtered%>%distinct(SEC_ID,.keep_all=T)
+      
+      simplepolys_filtered<-if(Type_Curve_Area=="SBSG LWR SH_N Loving"){
+        simplepolys_filtered<-simplepolys_filtered%>%left_join(spacing_override)
+        #simplepolys_filtered<-simplepolys_filtered%>%mutate(spacing_parameter=ifelse(spacing_flag>1,460,spacing_parameter))
+      }else{
+        simplepolys_filtered
+      }
+      
+      simplepolys_filtered_nest <-
+        simplepolys_filtered %>% select(SEC_ID, X_1, X_2, Y_1, Y_2,spacing_parameter) %>% group_by(SEC_ID)
+      # nest()
+      simplepolys_filtered_nest <-
+        simplepolys_filtered_nest %>% mutate(spacing_parameter = ifelse(is.na(spacing_parameter), 1280, spacing_parameter))
+      
+      #simplepolys_filtered_nest<-simplepolys_filtered_nest[1:10,]
+      
+      # ggplot(st_as_sf(polygon)%>%filter((SEC_ID %in% simplepolys_filtered_nest$SEC_ID)))+geom_sf()+
+      #   geom_sf(data=polygon%>%filter((SEC_ID ==4103)),fill='red')
+      
+   
+      
+        
+      ## For Loop----
+      parallel_spacing_fn <- function(X_1, X_2, Y_1, Y_2,spacing_parameter) {
+        x <-  c(X_1, X_2)
+        y <-  c(Y_1, Y_2)
+        
+        datalist = list()
+        datalist2 = list()
+        
+        
+        ##Distance Amount----
+        distance <-
+          c(
+            init_space,
+             spacing_parameter + init_space,
+            init_space + spacing_parameter * 2,
+            init_space + spacing_parameter * 3,
+            init_space + spacing_parameter * 4,
+            init_space + spacing_parameter * 5,
+            init_space + spacing_parameter * 6,
+            init_space + spacing_parameter * 7,
+            init_space + spacing_parameter * 8,
+            init_space + spacing_parameter * 9,
+            init_space + spacing_parameter * 10,
+            init_space + spacing_parameter * 11
+            # init_space + spacing_parameter * 12,
+            # init_space + spacing_parameter * 13
+            # init_space + spacing_parameter * 14,
+            # init_space + spacing_parameter * 15,
+            # init_space + spacing_parameter * 16
+          )
+        
+        
+        
+        for (d in distance) {
+          # Given a vector (defined by 2 points) and the distance,
+          # calculate a new vector that is distance away from the original
+          segment.shift <- function(x, y, d) {
+            # calculate vector
+            v <- c(x[2] - x[1], y[2] - y[1])
+            
+            # normalize vector
+            v <- v / sqrt((v[1] ** 2 + v[2] ** 2))
+            
+            # perpendicular unit vector
+            vnp <- c(-v[2], v[1])
+            
+            return(list(
+              x =  c(x[1] + d * vnp[1], x[2] + d * vnp[1]),
+              y =  c(y[1] + d * vnp[2], y[2] + d * vnp[2])
+            ))
+            
+          }
+          
+          
+          # allocate memory for the bike path
+          xn <- numeric((length(x) - 1) * 2)
+          yn <- numeric((length(y) - 1) * 2)
+          
+          for (i in 1:(length(x) - 1)) {
+            xs <- c(x[i], x[i + 1])
+            ys <- c(y[i], y[i + 1])
+            new.s <- segment.shift(xs, ys, -d)
+            xn[(i - 1) * 2 + 1] <-
+              new.s$x[1]
+            xn[(i - 1) * 2 + 2] <- new.s$x[2]
+            yn[(i - 1) * 2 + 1] <-
+              new.s$y[1]
+            yn[(i - 1) * 2 + 2] <- new.s$y[2]
+          }
+          
+          
+          
+          #dat1<-as_tibble()
+          dat1 <-
+            as.data.frame(xn) %>% mutate(id = row_number()) %>% mutate(Dist_Col = paste(d, "left", sep =
+                                                                                          "_"))
+          #datalist[[d]] <- dat1 # add it to your list
+          
+          #dat2<-as_tibble()
+          dat2 <-
+            as.data.frame(yn) %>% mutate(id = row_number()) %>% mutate(Dist_Col = paste(d, "left", sep =
+                                                                                          "_"))
+          #datalist2[[d]] <- dat2 # add it to your list
+          
+          
+          ###Now do right side
+          
+          # allocate memory for the path
+          # xn <- numeric((length(x) - 1) * 2)
+          # yn <- numeric((length(y) - 1) * 2)
+          # 
+          # for (i in 1:(length(x) - 1)) {
+          #   xs <- c(x[i], x[i + 1])
+          #   ys <- c(y[i], y[i + 1])
+          #   new.s <- segment.shift(xs, ys, -d)
+          #   xn[(i - 1) * 2 + 1] <-
+          #     new.s$x[1]
+          #   xn[(i - 1) * 2 + 2] <- new.s$x[2]
+          #   yn[(i - 1) * 2 + 1] <-
+          #     new.s$y[1]
+          #   yn[(i - 1) * 2 + 2] <- new.s$y[2]
+          # }
+          
+          
+          
+          # dat3 <-
+          #   as.data.frame(xn) %>% mutate(id = row_number()) %>% mutate(Dist_Col = paste(d, "right", sep =
+          #                                                                                 "_"))
+          
+          #datcomb <- full_join(dat1, dat3)
+          datcomb <- dat1
+          
+          datalist[[d]] <- datcomb # add it to your list
+          
+          
+          # dat4 <-
+          #   as.data.frame(yn) %>% mutate(id = row_number()) %>% mutate(Dist_Col = paste(d, "right", sep =
+          #                                                                                 "_"))
+          
+          # dat2comb <- full_join(dat2, dat4)
+            dat2comb <-dat2
+          datalist2[[d]] <- dat2comb # add it to your list
+          
+        }
+        big_data = do.call(rbind, datalist)
+        big_data2 = do.call(rbind, datalist2)
+        
+        
+        comb_data <- full_join(big_data, big_data2)
+        
+        sf <- st_as_sf(comb_data, coords = c("xn", "yn"))
+        
+        tst <- sf %>%
+          group_by(Dist_Col) %>%
+          summarise(do_union = FALSE) %>%
+          st_cast("LINESTRING")
+        
+        
+        st_crs(tst) <- "+init=epsg:2257"
+        tst <- st_transform(tst, "+init=epsg:2257")
+        
+        tst <- st_transform(tst, "+proj=longlat +datum=WGS84")
+        
+      }
+      
+      ####End For Loop----
+      
+      
+      
+      ex = simplepolys_filtered_nest %>%
+        #unnest_wider(data) %>%
+        mutate(res = pmap(list(X_1, X_2, Y_1, Y_2,spacing_parameter), parallel_spacing_fn))
+      
+      exf <- ex %>% unnest(res)
+      
+      
+      
+      # ggplot(st_as_sf(exf)) + geom_sf() + geom_sf(data = tier_outline, fill =
+      #  NA) + geom_sf(data = simplepolys, color = 'red') + geom_sf(data = acreage)
+      
+      
+      #rm(list=setdiff(ls(), c("exf","simplepolys","polygon","simplepolyswgs","polygon_intersect","acreage")))
+      
+      
+      ##Reproject Polygon ----
+      ex_sf <- st_as_sf(exf)
+      
+      
+      
+      
+      #ex_sf2257 <- st_transform(ex_sf, "+init=epsg:2257")
+      
+      #write_sf(ex_sf2257,"ex_sf2257.shp")
+      
+      st_line_midpoints <- function(sf_lines = NULL) {
+        g <- st_geometry(sf_lines)
+        
+        g_mids <- lapply(g, function(x) {
+          coords <- as.matrix(x)
+          
+          # this is just a copypaste of View(maptools:::getMidpoints):
+          get_mids <- function (coords) {
+            dist <- sqrt((diff(coords[, 1]) ^ 2 + (diff(coords[, 2])) ^ 2))
+            dist_mid <- sum(dist) / 2
+            dist_cum <- c(0, cumsum(dist))
+            end_index <- which(dist_cum > dist_mid)[1]
+            start_index <- end_index - 1
+            start <- coords[start_index, ]
+            end <- coords[end_index, ]
+            dist_remaining <- dist_mid - dist_cum[start_index]
+            mid <-
+              start + (end - start) * (dist_remaining / dist[start_index])
+            return(mid)
+          }
+          
+          mids <- st_point(get_mids(coords))
+        })
+        
+        out <- st_sfc(g_mids, crs = st_crs(sf_lines))
+        out <- st_sf(out)
+      }
+      
+      
+      midpoint <- st_line_midpoints(ex_sf)
+      midpoint <- st_as_sf(midpoint)
+      midpoint <- st_coordinates(midpoint)
+      midpoint <- as_tibble(midpoint)
+      ex_sf_drop_geom <- st_drop_geometry(ex_sf)
+      ex_sf_drop_geom <- ex_sf_drop_geom %>% select(SEC_ID, Dist_Col)
+      
+      midpoint <- midpoint %>% mutate(RowId = row_number())
+      ex_sf_drop_geom <-
+        ex_sf_drop_geom %>% ungroup() %>% mutate(RowId = row_number())
+      
+      
+      midpoint <- left_join(midpoint, ex_sf_drop_geom)
+      midpoint <- midpoint %>% select(-RowId)
+      
+      midpoint <- st_as_sf(midpoint, coords = c("X", "Y"))
+      
+      st_crs(midpoint) <- "+proj=longlat +datum=WGS84"
+      midpoint <- st_transform(midpoint, "+init=epsg:2257")
+      
+      midpoint <-
+        st_join(midpoint, polygon_intersect, join = st_within)
+      
+      
+      midpoint <- midpoint %>% filter(SEC_ID.x == SEC_ID.y)
+      
+      
+      midpoint <-
+        st_drop_geometry(midpoint) %>% select(SEC_ID.x, Dist_Col) %>% rename(SEC_ID =
+                                                                               SEC_ID.x)
+      
+      ex_sf <- left_join(midpoint, ex_sf)
+      ex_sf <- st_as_sf(ex_sf)
+      
+      #ex_sf<-st_transform(ex_sf,"+init=epsg:2257")
+      
+      
+      #rm(list=setdiff(ls(), c("intersection_df","ex_sf","polygon")))
+      
+      #moved to bottom
+      ex_sf <- ex_sf %>% mutate(GroupLineID = row_number())
+      
+      acreage_clip <- ex_sf
+      
+      
+      
+      #**Reload Tier Outline----
+      tier_outline <- tier_outlineOriginal
+      tier_outline <- tier_outline %>% filter(Type_Curve_Area == TC_Area)
+      tier_outline <- st_union(tier_outline)
+      
+      #st_crs(tier_outline) <- "+proj=longlat +datum=WGS84"
+      tier_outline<-st_transform(tier_outline, "+init=epsg:2257")
+      
+      tier_outline<-if (reservoir=='asdf') {
+        
+        tier_outline <- ms_dissolve(tier_outline, snap = T)
+        tier_outline <- ms_simplify(tier_outline, keep_shapes = T, keep = .2)
+      } else{
+        tier_outline
+      }
+      
+      tier_outline<-st_buffer(tier_outline,dist=0)
+      
+      intersection_df_clip <-st_intersection(acreage_clip, st_transform(tier_outline,st_crs(acreage_clip)))
+      
+      
+      
+      ###Skip if no rows----
+      # if (nrow(intersection_df_clip)==0) {
+      #   intersection_df_clip="blank_int_df_clip"
+      # } else{
+        st_crs(intersection_df_clip) <- "+proj=longlat +datum=WGS84"
+        
+        intersection_df_clip <-
+          st_transform(intersection_df_clip, "+init=epsg:2257")
+        intersection_df_clip <-
+          intersection_df_clip %>% mutate(length = st_length(intersection_df_clip))
+        intersection_df_clip$length <-
+          as.numeric(intersection_df_clip$length)
+        intersection_df_clip <-
+          intersection_df_clip %>% filter(length > 1)
+        
+        
+        st_crs(intersection_df_clip) <- "+init=epsg:2257"
+        intersection_df_clip <-
+          st_transform(intersection_df_clip, "+proj=longlat +datum=WGS84")
+        
+        
+        acreage_clip <- st_cast(intersection_df_clip, 'LINESTRING')
+        
+        acreage_clip <-
+          acreage_clip %>% mutate(length = st_length(acreage_clip) * 3.28084)
+        acreage_clip$length <- as.numeric(acreage_clip$length)
+        acreage_clip <- acreage_clip %>% filter(length > 100)
+        acreage_clip$SEC_ID <- as.character(acreage_clip$SEC_ID)
+        
+        
+        #Filter out PDP----
+        
+        lines <- read_sf('Op_Non_Unknown_Acreage/pdp/BD_ALL_WELLS.shp')
+        
+        lines <- st_transform(lines, "+init=epsg:32039")
+        
+        lines <- lines %>% mutate(length = st_length(lines))
+        
+        lines$length <- as.numeric(lines$length)
+        
+        lines <- lines %>% filter(length > 1000)
+        
+        #lines<-lines%>%rename(Reservr=Reservoir)
+        
+        lines<- lines%>%mutate(buffer_distance= ifelse(grepl(pdp_alias_res,Tank),1000,500))
+        
+        # SEP OUT TIER 1/TIER 2 LSBY,WFMPA/B TANK 500-1000----
+        
+        # lines<- lines%>%mutate(buffer_distance= ifelse(pdp_alias_res %in% c("LSBY","WFMP A","WFMP B")
+        #     & Reservr %in% c("LSBY","WFMP A",'WFMP B'),1000,500))
+        
+        #lines<- lines%>%mutate(buffer_distance= ifelse(Tier=="Tier1" & Reservr != reservoir,500,buffer_distance))
+              
+        lines <- st_buffer(lines,lines$buffer_distance, endCapStyle = 'FLAT')
+        lines <- as_Spatial(lines)
+        
+        
+        lines <-
+          rgeos::gBuffer(lines,
+                         width = -75,
+                         capStyle = 'FLAT',
+                         byid = TRUE)
+        lines = st_as_sf(lines)
+        
+          
+        ##Filter Zone
+        lines_zone <- lines %>% filter(grepl(pdp_zone, Tank, ignore.case = T))
+        #lines_zone <-lines_zone[1,]
+        
+        lines_zone <- st_transform(lines_zone, "+init=epsg:2257")
+        
+        lines_zone <- st_union(lines_zone)
+        
+        pdp_update_name<-str_replace_all(pdp_zone, "[|]", "_")
+        
+        #write_sf(lines_zone,paste("Midland_Inventory/reservoir_output/", "pdp", "_", pdp_update_name, ".shp", sep = ""))
+        
+        
+        intersection_df_clipf <-
+          st_transform(intersection_df_clip, "+init=epsg:2257")
+        
+        
+        removed_pdp_buffer <- intersection_df_clip
+        
+        ### Combine mile laterals by grid to make 2 mile laterals----
+        
+        ##**Read in original land grid** ----
+        polygon <- read_sf("Op_Non_Unknown_Acreage/sections_grid/sections_rowId.shp")
+        polygon<-polygon%>%mutate(area=as.numeric(st_area(geometry)))%>%arrange(desc(area))
+        polygon<-polygon[-1,]
+        
+        polygon<-polygon%>%select(-area)
+        
+        #st_crs(polygon) <- "+init=epsg:2257"
+        
+        #Remove after PXD Test----
+        #polygon <-
+        #  read_sf("PostProcessLandGrid/PP_Delaware_BAsin_River_South_3Mile.shp")
+        
+        
+        #polygon <- st_transform(polygon, "+init=epsg:2257")
+        
+        polygon <- polygon %>% mutate(SEC_ID = row_number())
+        
+        polygon <- st_transform(polygon, "+proj=longlat +datum=WGS84")
+        
+        polygon <- st_as_sf(polygon)
+        
+        polygon <- polygon %>% mutate(GridID = row_number())
+        
+        polygon <- polygon %>% select(GridID)
+        
+        removed_pdp_buffer <-
+          st_transform(removed_pdp_buffer, "+proj=longlat +datum=WGS84")
+        #removed_pdp_buffer<-st_transform(removed_pdp_buffer,"+init=epsg:2257")
+        
+        #polygon<-st_transform(polygon,"+proj=longlat +datum=WGS84")
+        polygon <- st_buffer(polygon, dist = 0)
+        
+        removed_pdp_buffer_filter <-
+          st_intersection(removed_pdp_buffer, polygon)
+        
+        
+        ###Start from here if having issues----
+        final_lines <-
+          removed_pdp_buffer_filter %>% select(GroupLineID, GridID, SEC_ID)
+        
+        st_crs(final_lines) <- "+proj=longlat +datum=WGS84"
+        final_lines <- st_transform(final_lines, "+init=epsg:2257")
+        
+        
+        options(scipen = 999)
+        final_lines <-
+          final_lines %>% ungroup() %>% mutate(length = st_length(final_lines))
+        final_lines$length <- as.numeric(final_lines$length)
+        
+        
+        final_lines <- final_lines %>% 
+          group_by(GroupLineID, SEC_ID) %>%
+          summarize(geometry = st_union(geometry))
+        
+        
+        
+        final_lines <-
+          final_lines %>% ungroup() %>% mutate(length = st_length(final_lines))
+        final_lines$length <- as.numeric(final_lines$length)
+        
+        final_lines <- final_lines %>% filter(length > 1)
+        
+        
+        
+        
+        ##Remove list objects----
+        
+        final_lines_rm_geo <-
+          final_lines# %>% filter(!grepl("list", geometry))
+        
+        
+        final_lines_rm_geo <- st_collection_extract(final_lines_rm_geo, "LINESTRING")
+        final_lines_rm_geo <- st_cast(final_lines_rm_geo, 'LINESTRING')
+        
+        
+        ###Add Drilling Unit ID to filter after line extension----
+        
+        
+        polygon <- st_transform(polygon, "+init=epsg:2257")
+        
+        ext_line_id <- final_lines_rm_geo
+        
+        st_crs(ext_line_id) <- st_crs(polygon)
+        
+        ext_line_id <- st_intersection(final_lines_rm_geo, polygon)
+        
+        ext_line_id <- st_collection_extract(ext_line_id, "LINESTRING")
+        ext_line_id <- st_cast(ext_line_id, 'LINESTRING')
+        
+        
+        #write_sf(ext_line_id,"ext_line_id.shp")
+        
+        ext_line_id <- ext_line_id %>% mutate(length_diff =  as.numeric(st_length(ext_line_id)))
+        
+        ext_line_id <- ext_line_id %>% group_by(GroupLineID) %>%
+          filter(length_diff == max(length_diff)) %>% ungroup()
+        
+        
+        
+        ext_line_id <-
+          st_drop_geometry(ext_line_id) %>% ungroup() %>% select(length, GridID, GroupLineID)
+        
+        ext_line_id <- ext_line_id %>% arrange(length)
+        
+        final_lines_rm_geo <- final_lines_rm_geo %>% arrange(length)
+        
+        final_lines_rm_geo <-
+          left_join(final_lines_rm_geo, ext_line_id[, 2:3])
+        
+        ##Find surface and bottom hole locations----
+        
+        final_lines_surf_pts = sfc_as_cols(st_cast(st_as_sf(
+          st_line_sample(final_lines_rm_geo, sample = c(0))
+        ), "POINT"))
+        final_lines_surf_pts <- final_lines_surf_pts[,-1]
+        final_lines_surf_pts <-
+          final_lines_surf_pts %>% rename(final_lines_surf_long = x...2,
+                                          final_lines_surf_lat = y) %>% mutate(Count = row_number())
+        
+        final_lines_bh_pts = sfc_as_cols(st_cast(st_as_sf(
+          st_line_sample(final_lines_rm_geo, sample = c(1))
+        ), "POINT"))
+        final_lines_bh_pts <- final_lines_bh_pts[,-1]
+        final_lines_bh_pts <-
+          final_lines_bh_pts %>% rename(final_lines_bh_long = x...2,
+                                        final_lines_bh_lat = y) %>% mutate(Count = row_number())
+        
+        final_lines_pts <-
+          full_join(final_lines_surf_pts, final_lines_bh_pts)
+        
+        final_lines_rm_geo <- final_lines_rm_geo %>%
+          mutate(Count = row_number()) %>%
+          left_join(final_lines_pts)
+        
+        final_lines_rm_geo <- st_drop_geometry(final_lines_rm_geo)
+        
+        long_final_lines <- final_lines_rm_geo %>%
+          select(Count, final_lines_surf_long, final_lines_bh_long) %>%
+          pivot_longer(2:3, values_to = "longitude") %>%
+          group_by(Count) %>% mutate(CountGroup = row_number())
+        
+        long_final_lines <-
+          long_final_lines %>% select(longitude, Count, CountGroup)
+        
+        long_final_lines <-
+          long_final_lines %>% pivot_wider(Count, names_from = CountGroup,
+                                           values_from = longitude) %>%
+          rename(surf_long = `1`, bh_long = `2`)
+        
+        lat_final_lines <- final_lines_rm_geo %>%
+          select(Count, final_lines_surf_lat, final_lines_bh_lat) %>%
+          pivot_longer(2:3, values_to = "latitude") %>% group_by(Count) %>%
+          mutate(CountGroup = row_number())
+        
+        lat_final_lines <-
+          lat_final_lines %>% select(Count, latitude, CountGroup)
+        
+        
+        lat_final_lines <-
+          lat_final_lines %>% pivot_wider(Count, names_from = CountGroup,
+                                          values_from = latitude) %>%
+          rename(surf_lat = `1`, bh_lat = `2`)
+        
+        
+        
+        ###Add unique count before join----
+        
+        wells_prep <- full_join(long_final_lines, lat_final_lines)
+        
+        wells_prep <-
+          left_join(wells_prep, final_lines_rm_geo %>% select(Count, length))
+        
+        ##Extend Line by 10k feet both directions----
+        
+        ext_line <-
+          wells_prep %>% mutate(
+            surf_lat_ext = surf_lat - (bh_lat - surf_lat) * 20000 / length,
+            surf_long_ext = surf_long - (bh_long -
+                                           surf_long) * 20000 / length,
+            bh_lat_ext = bh_lat + (bh_lat - surf_lat) *
+              20000 / length,
+            bh_long_ext = bh_long + (bh_long - surf_long) *
+              20000 / length
+          )
+        
+        ext_line <- ext_line %>%
+          select(Count, surf_lat_ext, surf_long_ext, bh_lat_ext, bh_long_ext)
+        
+        ext_line_lat <-
+          pivot_longer(ext_line[, c(1, 2, 4)], c(2, 3)) %>%
+          group_by(Count) %>%
+          mutate(CountGroup = row_number())
+        
+        ext_line_lat <-
+          ext_line_lat %>% select(value, Count, CountGroup) %>% rename(latitude =
+                                                                         value)
+        
+        
+        ext_line_long <-
+          pivot_longer(ext_line[, c(1, 3, 5)], c(2, 3)) %>% group_by(Count) %>%
+          mutate(CountGroup = row_number())
+        
+        ext_line_long <-
+          ext_line_long %>% select(value, Count, CountGroup) %>% rename(longitude =
+                                                                          value)
+        
+        combined <- full_join(ext_line_lat, ext_line_long)
+        
+        
+        combined <-
+          combined %>% filter(!is.na(longitude),!is.na(latitude))
+        
+        combined <- st_as_sf(combined,
+                             coords = c("longitude", "latitude"))
+        
+        
+        combined <- combined %>%
+          group_by(Count) %>%
+          summarise(do_union = FALSE) %>%
+          st_cast("LINESTRING")
+        
+        
+        st_crs(combined) <- "+init=epsg:2257"
+        combined <- st_transform(combined, "+init=epsg:2257")
+        
+        
+        ext_line <- combined[, 1]
+        
+        ext_line <- ext_line %>% mutate(length = st_length(ext_line))
+        ext_line$length <- as.numeric(ext_line$length)
+        
+        ext_line_id <- ext_line_id %>% mutate(Count = row_number()) %>%
+          rename(orig_length = length)
+        
+        ext_line <- left_join(ext_line, final_lines_rm_geo[, 4:5])
+        
+        
+        
+        ###Clip line to Drilling Unit
+        
+        ext_line = st_intersection(ext_line, polygon)
+        
+        
+        ext_line <- st_collection_extract(ext_line, "LINESTRING")
+        ext_line <- st_cast(ext_line, 'LINESTRING')
+        
+        
+        
+        ext_line_f = ext_line %>% filter(GridID == GridID.1)
+        
+           
+        
+        #ext_line<-read_sf("ext_line3.shp")
+        
+        
+        #st_crs(ex_sf)<- "+proj=longlat +datum=WGS84"
+        #ex_sf<-st_transform(ex_sf,"+init=epsg:2257")
+        
+        
+        ####UPDATE DISTANCE SPACING PARAMETERS!!!!----
+        
+        acreage<-st_transform(acreage,"+init=epsg:2257")
+        
+        acreage <- st_buffer(acreage, dist = 0)
+        
+        acreage_dissolve <- st_union(acreage)
+        
+        ###** ext_line to multiline string----
+        ###***st_collection_extract***---
+        acreage_clip <- st_collection_extract(ext_line_f, "LINESTRING")
+        acreage_clip <- st_cast(acreage_clip, 'LINESTRING')
+        
+        #write_sf(acreage_clip,"acreage_clip.shp")
+        ####ASDF CHECK CRS----
+        
+        acreage_clip <-
+          st_intersection(acreage_clip, acreage_dissolve, tolerance = 0)
+        
+        
+        
+        
+        acreage_clip <-
+          st_collection_extract(acreage_clip, "LINESTRING")
+        
+        acreage_clip <-
+          acreage_clip %>% mutate(length = st_length(acreage_clip))
+        acreage_clip$length <- as.numeric(acreage_clip$length)
+        
+        
+        ###** Once again remove pdp using zone buffer----
+        
+        #lines_zone<-st_transform(lines_zone,"+init=epsg:2257")
+        lines_zone <- st_as_sf(lines_zone)
+        
+        # acreage_clip <- st_difference(acreage_clip, lines_zone)
+        # acreage_clip <- st_collection_extract(acreage_clip, "LINESTRING")
+        # acreage_clip <- st_cast(acreage_clip, 'LINESTRING')
+        
+        acreage_clip<- acreage_clip%>%mutate(length=as.numeric(st_length(acreage_clip)))
+        
+        
+        ####################################################################
+        ######################################################################
+        #Unhash everything from here
+        
+        removed_pdp_buffer_final<-acreage_clip%>%mutate(Count=row_number())
+
+        removed_pdp_buffer_final$reservoir <- reservoir
+        removed_pdp_buffer_final$company <- operator_filter
+        removed_pdp_buffer_final$pdp_basic <- pdp_zone
+
+        ##*Join Laterals----
+
+
+        mround <-
+          function(number, multiple)
+            multiple * round(number / multiple)
+
+        x <- removed_pdp_buffer_final
+
+
+        x<-distinct(x)
+
+        x<-x%>%mutate(Count=row_number())
+
+        x<-x%>%mutate(length=as.numeric(st_length(x)))
+
+        x<-x%>%filter(length>1)
+
+        ###Add Ifelse
+
+        # if(nrow(x)<1){
+        #   x="blank_pt"
+        # } else{
+
+          line_prep<-x
+
+          st_crs(line_prep)<- "+init=epsg:2257"
+          line_prep<-st_transform(line_prep,"+proj=longlat +datum=WGS84")
+
+          rnm<-function(x,y)round(x/y)*y
+          line_prep<-line_prep%>%mutate(bearing=round(line_bearing(.,bidirectional=T),0),bearing=ifelse(bearing==-1,0,bearing),bearing=rnm(bearing,5))
+
+          x<-left_join(x,st_drop_geometry(line_prep)%>%select(Count,bearing))
+
+          line_ex_buf <- st_buffer(x, dist = 150)
+
+          
+          
+          line_ex_buf<-line_ex_buf%>%group_by(bearing)%>%nest()
+
+
+          line_nest=line_ex_buf%>%mutate(union=map(.x=data,.f=~st_union(.)))
+
+          line_nest<-line_nest%>%unnest(union)
+          
+          
+           
+           line_nest<-line_nest$union%>%as("Spatial")%>%st_as_sf()
+           
+           line_nest<-line_nest%>%mutate(polyid=row_number())
+           #dissolved <- st_union(line_ex_buf) %>% as('Spatial') %>% st_as_sf()
+           
+           singlepart <- st_cast(line_nest, 'POLYGON') %>%
+             mutate(Buf_ID = as.factor(row_number()))
+          
+           
+           
+           x<-st_intersection(x,singlepart)
+           
+          
+           line_ex_f <- x %>%
+             group_by(Buf_ID,polyid) %>%
+             summarise(do_union = T) %>%
+             st_cast("MULTILINESTRING")
+        
+           
+           line_ex_f<- line_ex_f%>%mutate(length=st_length(geometry))
+              
+           
+        #   line_ex_f <-
+        #     line_ex_f %>%ungroup()%>% mutate(comb_lenght = st_length(line_ex_f))
+        #   
+        #   line_ex_f$Lat_TC = mround(line_ex_f$comb_lenght / 5000, .25)
+        #   
+        #   combined_lines <- line_ex_f
+        #   
+        #   combined_lines <- st_as_sf(combined_lines)
+        #   
+        #   combined_lines <-
+        #     combined_lines %>% mutate(length = st_length(combined_lines))
+        #   
+        #   combined_lines$Lat_TC = mround(combined_lines$length / 5000, .25)
+        #   
+        #   CreateSegment <- function(coords, from, to) {
+        #     distance <- 0
+        #     coordsOut <- c()
+        #     biggerThanFrom <- F
+        #     for (i in 1:(nrow(coords) - 1)) {
+        #       d <- sqrt((coords[i, 1] - coords[i + 1, 1])^2 + (coords[i, 2] - coords[i + 
+        #                                                                                1, 2])^2)
+        #       distance <- distance + d
+        #       if (!biggerThanFrom && (distance > from)) {
+        #         w <- 1 - (distance - from)/d
+        #         x <- coords[i, 1] + w * (coords[i + 1, 1] - coords[i, 1])
+        #         y <- coords[i, 2] + w * (coords[i + 1, 2] - coords[i, 2])
+        #         coordsOut <- rbind(coordsOut, c(x, y))
+        #         biggerThanFrom <- T
+        #       }
+        #       if (biggerThanFrom) {
+        #         if (distance > to) {
+        #           w <- 1 - (distance - to)/d
+        #           x <- coords[i, 1] + w * (coords[i + 1, 1] - coords[i, 1])
+        #           y <- coords[i, 2] + w * (coords[i + 1, 2] - coords[i, 2])
+        #           coordsOut <- rbind(coordsOut, c(x, y))
+        #           break
+        #         }
+        #         coordsOut <- rbind(coordsOut, c(coords[i + 1, 1], coords[i + 1, 
+        #                                                                  2]))
+        #       }
+        #     }
+        #     return(coordsOut)
+        #   }
+        #   
+        #   
+        #   CreateSegments <- function(coords, length = 0, n.parts = 0) {
+        #     stopifnot((length > 0 || n.parts > 0))
+        #     # calculate total length line
+        #     total_length <- 0
+        #     for (i in 1:(nrow(coords) - 1)) {
+        #       d <- sqrt((coords[i, 1] - coords[i + 1, 1])^2 + (coords[i, 2] - coords[i + 
+        #                                                                                1, 2])^2)
+        #       total_length <- total_length + d
+        #     }
+        #     
+        #     # calculate stationing of segments
+        #     if (length > 0) {
+        #       stationing <- c(seq(from = 0, to = total_length, by = length), total_length)
+        #     } else {
+        #       stationing <- c(seq(from = 0, to = total_length, length.out = n.parts), 
+        #                       total_length)
+        #     }
+        #     
+        #     # calculate segments and store the in list
+        #     newlines <- list()
+        #     for (i in 1:(length(stationing) - 1)) {
+        #       newlines[[i]] <- CreateSegment(coords, stationing[i], stationing[i + 
+        #                                                                          1])
+        #     }
+        #     return(newlines)
+        #   }
+        #   
+        #   
+        #   MergeLast <- function(lst) {
+        #     l <- length(lst)
+        #     lst[[l - 1]] <- rbind(lst[[l - 1]], lst[[l]])
+        #     lst <- lst[1:(l - 1)]
+        #     return(lst)
+        #   }
+        #   
+        #   
+        #   SegmentSpatialLines <- function(sl, length = 0, n.parts = 0, merge.last = FALSE) {
+        #     stopifnot((length > 0 || n.parts > 0))
+        #     id <- 0
+        #     newlines <- list()
+        #     sl <- as(sl, "SpatialLines")
+        #     for (lines in sl@lines) {
+        #       for (line in lines@Lines) {
+        #         crds <- line@coords
+        #         # create segments
+        #         segments <- CreateSegments(coords = crds, length, n.parts)
+        #         if (merge.last && length(segments) > 1) {
+        #           # in case there is only one segment, merging would result into error
+        #           segments <- MergeLast(segments)
+        #         }
+        #         # transform segments to lineslist for SpatialLines object
+        #         for (segment in segments) {
+        #           newlines <- c(newlines, Lines(list(Line(unlist(segment))), ID = as.character(id)))
+        #           id <- id + 1
+        #         }
+        #       }
+        #     }
+        #     return(SpatialLines(newlines))
+        #   }
+        #   
+        #   
+        #   pt <- combined_lines %>% group_by(Buf_ID,polyid) %>% summarize(m = mean(row_number())) %>% st_cast("LINESTRING")
+        #   
+        #   tc_update_name<-Type_Curve_Area
+        #   
+        #   
+        #   tc_update_name<-str_replace_all(tc_update_name, "[+]", "")
+        #   pdp_update_name<-str_replace_all(pdp_zone, "[|]", "_")
+        #   
+        #   
+        #   
+        #   pt <- st_cast(pt, "POINT")%>%group_by(Buf_ID,polyid)%>%mutate(id=row_number())
+        #   
+        #   
+        #   # if(nrow(pt)<1){
+        #   #   polygon="blank_pt"
+        #   # } else{
+        #     pt<-sfc_as_cols(pt)  
+        #     
+        #     
+        #     pt<- pt%>%group_by(Buf_ID,polyid)%>%mutate(RowID=row_number())%>%filter(y==min(y)|y==max(y))
+        #     
+        #     pt <- pt %>% group_by(Buf_ID,polyid) %>% summarize(m = mean(row_number())) %>% st_cast("LINESTRING")
+        #     pt<-pt%>%ungroup()%>%mutate(length=st_length(pt))
+        #     
+        #     pt<-pt%>%mutate(length=as.numeric(length))%>%
+        #       mutate(Lat_TC = mround(length / 5300, .25))%>%select(-m)
+        #    
+        #     pt<- pt%>%mutate(id=row_number())
+        #     
+        #     
+            
+        #########################################################################
+        ###############################################################################
+        
+        
+        
+            #Write Extended Line----
+            write_sf(
+              line_ex_f%>%select(geometry)%>%mutate(Company=unique(operator_filter),reservoir=reservoir,TC_Area=Type_Curve_Area),
+              paste(
+                "Midland_Inventory/Basin_Inventory/",
+                unique(operator_filter),
+                "_",
+                reservoir,
+                "_",
+                RowNumId,
+                ".shp",
+                sep = ""
+              )
+            )
+            
+            
+            
+            # #combined_lines_split<-pt
+            # 
+            # 
+            # #split into 15000 length
+            # a<-pt%>%filter(Lat_TC%%3==0|(Lat_TC>4.9 & Lat_TC<6)|Lat_TC>7.9)
+            # 
+            # #split into 2 pieces Update this and next code to 3.25----
+            # b<-pt%>%filter((Lat_TC>3 & Lat_TC<4.9))
+            # 
+            # #keep as is
+            # c<-pt%>%filter(Lat_TC<3)
+            # 
+            # #split into 3 pieces
+            # d<-pt%>%filter(Lat_TC>6 & Lat_TC%%3!=0 & Lat_TC<8)
+            # 
+            # 
+            # #a
+            # combined_lines_split = if (nrow(a) == 0) {
+            #   a
+            # } else {
+            #   st_as_sf(SegmentSpatialLines(as_Spatial(a),
+            #                                length = 15900, merge.last = F))
+            # }
+            # 
+            # combined_lines_split = if (nrow(combined_lines_split) ==0) {
+            #   combined_lines_split
+            # } else {
+            #   combined_lines_split %>%
+            #     mutate(length = as.numeric(st_length(combined_lines_split))) %>%
+            #     mutate(id = paste("new", row_number()))
+            # }
+            # 
+            # #b
+            # 
+            # combined_lines_split_two_parts = if (nrow(b) == 0) {
+            #   b
+            # } else {
+            #   st_as_sf(SegmentSpatialLines(as_Spatial(b),
+            #                                n.parts = 3, merge.last = F))
+            # }
+            # 
+            # combined_lines_split_two_parts = if (nrow(combined_lines_split_two_parts) ==
+            #                                      0) {
+            #   combined_lines_split_two_parts
+            # } else {
+            #   combined_lines_split_two_parts %>%
+            #     mutate(length = as.numeric(st_length(combined_lines_split_two_parts))) %>%
+            #     mutate(id = paste("new2", row_number()))
+            # }
+            # ####
+            # combined_lines_split_three_parts = if (nrow(d) == 0) {
+            #   d
+            # } else {
+            #   st_as_sf(SegmentSpatialLines(as_Spatial(d),
+            #                                n.parts = 4, merge.last = F))
+            # }
+            # 
+            # combined_lines_split_three_parts = if (nrow(combined_lines_split_three_parts) ==
+            #                                        0) {
+            #   combined_lines_split_three_parts
+            # } else {
+            #   combined_lines_split_three_parts %>%
+            #     mutate(length = as.numeric(st_length(combined_lines_split_three_parts))) %>%
+            #     mutate(id = paste("new3", row_number()))
+            # }
+            # 
+            # 
+            # 
+            # 
+            # combined_lines_split <-if ((nrow(combined_lines_split)==0 | nrow(combined_lines_split)>0) & nrow(combined_lines_split_two_parts)==0) {
+            #   combined_lines_split
+            # }else if(nrow(combined_lines_split)==0 & nrow(combined_lines_split_two_parts)>0){
+            #   combined_lines_split_two_parts
+            # } else if (nrow(combined_lines_split)>0 & nrow(combined_lines_split_two_parts)>0){
+            #   st_as_sf(raster::bind(
+            #     as_Spatial(combined_lines_split),
+            #     as_Spatial(combined_lines_split_two_parts)
+            #   ))
+            # }
+            # 
+            # 
+            # combined_lines_split <-if ((nrow(combined_lines_split)==0 | nrow(combined_lines_split)>0) & nrow(combined_lines_split_three_parts)==0) {
+            #   combined_lines_split
+            # }else if(nrow(combined_lines_split)==0 & nrow(combined_lines_split_three_parts)>0){
+            #   combined_lines_split_three_parts
+            # } else if (nrow(combined_lines_split)>0 & nrow(combined_lines_split_three_parts)>0){
+            #   st_as_sf(raster::bind(
+            #     as_Spatial(combined_lines_split),
+            #     as_Spatial(combined_lines_split_three_parts)
+            #   ))
+            # }
+            # 
+            # 
+            # combined_lines_split <-if ((nrow(combined_lines_split)==0 | nrow(combined_lines_split)>0) & nrow(c)==0) {
+            #   combined_lines_split
+            # }else if(nrow(combined_lines_split)==0 & nrow(c)>0){
+            #   c
+            # } else if (nrow(combined_lines_split)>0 & nrow(c)>0){
+            #   st_as_sf(raster::bind(
+            #     as_Spatial(combined_lines_split),
+            #     as_Spatial(c)
+            #   ))
+            # }
+            # 
+            # 
+            # combined_lines_split<-combined_lines_split%>%mutate(length=as.numeric(st_length(combined_lines_split))) 
+            # combined_lines_split$Lat_TC = mround(combined_lines_split$length / 5000, .25)
+            # 
+            # combined_lines_split<-combined_lines_split%>%mutate(id=row_number())
+            # 
+            # tc_update_name=Type_Curve_Area
+            # 
+            # 
+            # tc_update_name<-str_replace_all(tc_update_name, "[+]", "")
+            # pdp_update_name<-str_replace_all(pdp_zone, "[|]", "_")
+            # 
+            # 
+            # 
+            # 
+            # combined_lines_split<-combined_lines_split%>%ungroup()%>%mutate(length=as.numeric(st_length(combined_lines_split)))
+            # combined_lines_split$Lat_TC = mround(combined_lines_split$length / 5000, .25)
+            # 
+            # combined_lines_split<<-combined_lines_split
+            # 
+            # write.xlsx(
+            #   st_drop_geometry(combined_lines_split)%>%mutate(Company=operator_filter,reservoir=reservoir),
+            #   paste(
+            #     "Inventory/Midland/Company_Inventory/",
+            #     operator_filter,
+            #     "_",
+            #     reservoir,
+            #     "_",
+            #     tc_update_name,
+            #     ".xlsx",
+            #     sep = ""
+            #   ),overwrite = T
+            # )
+            # 
+            # 
+            # write_sf(
+            #   combined_lines_split%>%mutate(Company=operator_filter,reservoir=reservoir,TC_Area=Type_Curve_Area),
+            #   paste(
+            #     "Inventory/Midland/Company_Inventory/",
+            #     operator_filter,
+            #     "_",
+            #     reservoir,
+            #     "_",
+            #     tc_update_name,
+            #     ".shp",
+            #     sep = ""
+            #   )
+            #   
+            # )
+            
+            
+          }
+
+#END----
+
+#id<- id%>%filter(RowNumId %in% c(2,3,8,11))
+#id<- id%>%arrange(desc(RowNumId))
+
+pmap(id,op_func)
+
+
+#op_function2 <- possibly(op_func, otherwise = NA)
+
+#pmap(id[6:9,],op_function2)
+
+rm(list=ls())
+
+
+
