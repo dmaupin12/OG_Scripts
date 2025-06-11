@@ -1,0 +1,170 @@
+library(sf)
+library(tidyverse)
+library(lwgeom)
+library(matrixStats)
+
+options(scipen = 9999999)
+
+# Names of shapefiles----
+
+### Midland_Basin_Main== 16
+### Delaware_Basin_Loving== 18.5
+### Delaware_Basin_Toyah== -12
+### Delaware_Midland_NS_sec==0
+### Delaware_Basin_Pecos_River== -40
+### Delaware_Basin_River_North== -57
+### Delaware_Basin_River_South== -11
+
+
+
+
+
+#First we need to remove PDP sections----
+
+
+
+###Update rotation_number----
+
+
+
+run_all_grids<-function(input){
+  
+  area=input
+  
+ rotation = function(a) {
+    r = a * pi / 180 #degrees to radians
+    matrix(c(cos(r), sin(r),-sin(r), cos(r)), nrow = 2, ncol = 2)
+  }
+  
+
+rotation_number = if(area=="Midland_Basin_Main"){
+  rotation_number=16
+}else if(area=="Delaware_Basin_Loving"){
+  rotation_number=18.5
+}else if(area=="Delaware_Basin_Toyah"){
+  rotation_number=-12
+}else if(area=="Delaware_Midland_NS_sec"){
+  rotation_number=0
+}else if(area=="Delaware_Basin_Pecos_River"){
+  rotation_number=-40
+}else if(area=="Delaware_Basin_River_North"){
+  rotation_number=-57
+}else if(area=="Delaware_Basin_River_South"){
+  rotation_number=-11
+}
+
+  
+
+polygon <-  read_sf(paste('PreProcessLandGrid/',area,'.shp',sep=""))
+polygon <- polygon[1:10, 3:4]
+polygon<- polygon%>%mutate(valid=st_is_empty(geometry))
+polygon<- polygon%>%filter(valid==F)%>%select(-valid)
+
+st_crs(polygon) <- "+proj=longlat +datum=WGS84"
+polygon <- st_transform(polygon, "+init=epsg:2257")
+
+polygon<-st_buffer(polygon,dist=0)
+
+
+# Remove invalid geometries
+polygon <- st_buffer(polygon, dist = 0)
+
+polygon <- polygon %>% mutate(New_ID = row_number())
+
+##Rotate----
+
+sec_rotate = st_centroid(st_union(polygon))
+rotate_nfc = st_geometry(polygon)
+
+sec_update_ro = (rotate_nfc - sec_rotate) * rotation(rotation_number) + sec_rotate
+
+sec_update_ro = st_as_sf(sec_update_ro)
+
+sec_update_ro = sec_update_ro %>% mutate(New_ID = row_number())
+
+
+st_crs(sec_update_ro) <- "+init=epsg:2257"
+
+
+
+empty_db<-tribble()
+
+shp<-sec_update_ro%>%mutate(row_id=row_number())
+
+uniqe_rows=unique(shp$row_id)
+
+create_grid=function(y){
+  
+  grid <- shp %>%select(row_id)%>%filter(row_id==y) %>%
+    st_make_grid(cellsize = 1000, what = "polygons") %>% # grid of points
+    st_intersection(shp)                               # only within the polygon
+  
+  grid<-st_as_sf(grid)%>%mutate(row_id=y)
+  
+  empty_db <<- rbind(empty_db, grid)
+  print(y)
+}
+
+
+
+lapply(uniqe_rows,create_grid)  
+
+
+combined<-st_as_sf(empty_db)
+
+combined<-combined%>%mutate(check=as.numeric(st_area(x)))%>%filter(check>0)
+
+
+sec_rotate = st_centroid(st_union(combined))
+rotate_nfc = st_geometry(combined)
+
+final_shp = (rotate_nfc - sec_rotate) * rotation(-rotation_number) + sec_rotate
+
+final_shp = st_as_sf(final_shp)
+
+
+st_crs(final_shp) <- "+init=epsg:2257"
+final_shp <- st_transform(final_shp, "+init=epsg:2257")
+
+final_shp<-left_join(final_shp%>%mutate(join_id=row_number()),st_drop_geometry(combined)%>%mutate(join_id=row_number()))
+
+empty_db<-tribble()
+
+clip_by_section= function(id){
+  clip= st_intersection(final_shp%>%filter(row_id==id),polygon%>%filter(New_ID==id))
+
+  empty_db <<- rbind(empty_db, clip)
+  paste(print(id),"almost done!")
+  }
+
+lapply(unique(final_shp$row_id),clip_by_section)
+
+empty_db= empty_db%>%mutate(area_filter=as.numeric(st_area(x)))%>%filter(area_filter>0)%>%ungroup()
+empty_db=empty_db%>%mutate(id_unique=row_number())%>%arrange(id_unique)
+empty_db=empty_db%>%mutate(length=as.numeric(st_length(x)))
+empty_db<-empty_db%>%filter(length==0)
+empty_db<-empty_db%>%filter(area_filter>100)
+
+empty_db<<- empty_db
+
+st_crs(empty_db) <- "+init=epsg:2257"
+empty_db <- st_transform(empty_db, "+init=epsg:2257")
+
+run=1
+
+write_sf(empty_db,paste("n_s/",area,run,'_grid.shp',sep=""))
+}
+
+plot(empty_db[1:20,])
+
+#area_list= c("Delaware_Midland_NS_sec","Delaware_Basin_Pecos_River","Delaware_Basin_River_North","Delaware_Basin_River_South")
+#"Midland_Basin_Main","Delaware_Basin_Loving","Delaware_Basin_Toyah",
+
+area_list= c("Delaware_Midland_NS_sec")
+
+lapply(area_list,run_all_grids)
+
+x=empty_db
+
+st_nearest_feature(x[9,],x[5:8,])
+
